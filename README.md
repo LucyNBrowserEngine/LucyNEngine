@@ -1,7 +1,3 @@
-Here is the consolidated README, merging the new content (LNM, Google Sign-In, Logger, and the "Why it makes LucyN better" section) into the existing structure while maintaining the tone and technical depth.
-
-***
-
 # LucyN Engine
 
 **Built for Nothing Browser. Powered by the Nothing philosophy: we don't care about beauty, we care about stealth, capture, and truth.**
