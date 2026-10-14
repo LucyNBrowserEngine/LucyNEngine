@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moonbug - LucyN capture dashboard</title>
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #12161b; --line: #222a33; --text: #d7dde4; --dim: #7d8793;
+    --ok: #3fb950; --info: #58a6ff; --warn: #d29922; --bad: #f85149; --accent: #b392f0;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  header { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding: 10px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 16px; letter-spacing: .5px; }
+  h1 small { color: var(--dim); font-weight: normal; margin-left: 8px; }
+  .grow { flex: 1; }
+  #dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--bad); margin-right: 6px; }
+  #dot.live { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  button, input { font: inherit; color: var(--text); background: #0f1318; border: 1px solid var(--line);
+    border-radius: 4px; padding: 4px 10px; }
+  button { cursor: pointer; } button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  input { width: 230px; }
+  .stat b { color: var(--accent); }
+  #layout { display: flex; height: calc(100% - 52px); }
+  #listwrap { flex: 1; overflow: auto; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  th { position: sticky; top: 0; background: var(--panel); text-align: left; color: var(--dim);
+    font-weight: normal; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 3px 8px; border-bottom: 1px solid #161c23; white-space: nowrap; max-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  td.url { max-width: 520px; }
+  tr.row { cursor: pointer; } tr.row:hover { background: #151b22; } tr.sel { background: #1b2430 !important; }
+  .s2 { color: var(--ok); } .s3 { color: var(--info); } .s4 { color: var(--warn); } .s5, .s0 { color: var(--bad); }
+  .seal-ok { color: var(--ok); } .seal-bad { color: var(--bad); } .seal-unk { color: var(--dim); }
+  #empty { padding: 40px 20px; color: var(--dim); text-align: center; }
+  #detail { width: 46%; max-width: 760px; min-width: 340px; overflow: auto; background: var(--panel);
+    border-left: 1px solid var(--line); padding: 12px 14px; }
+  #detail[hidden] { display: none; }
+  #detail h2 { font-size: 13px; margin: 14px 0 6px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px; }
+  #detail h2:first-child { margin-top: 0; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+  .kv > div:nth-child(odd) { color: var(--dim); }
+  .kv > div { overflow-wrap: anywhere; }
+  .hdrs { width: 100%; } .hdrs td { white-space: normal; max-width: none; overflow-wrap: anywhere; vertical-align: top; border: 0; padding: 1px 6px 1px 0; }
+  .hdrs td:first-child { color: var(--info); width: 1%; white-space: nowrap; }
+  pre { margin: 0; padding: 8px; background: #0b0e12; border: 1px solid var(--line); border-radius: 4px;
+    max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .bar { height: 7px; background: var(--accent); border-radius: 3px; min-width: 2px; }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 3px; border: 1px solid var(--line); margin-left: 6px; font-size: 11px; }
+  .badge.good { color: var(--ok); border-color: var(--ok); } .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+  #verdict { margin-left: 4px; }
+  .close { float: right; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Moonbug<small>nothing touches the network unseen</small></h1>
+  <span class="stat"><span id="dot"></span><span id="conn">connecting&hellip;</span></span>
+  <span class="stat">captured <b id="n">0</b></span>
+  <span class="stat" id="pendingwrap" hidden>(<b id="pending">0</b> waiting)</span>
+  <span class="grow"></span>
+  <input id="filter" placeholder="filter: method, status, url..." autocomplete="off" spellcheck="false">
+  <button id="pause">Pause</button>
+  <button id="verifyall">Verify all seals</button>
+  <button id="clear">Clear</button>
+</header>
+<div id="layout">
+  <div id="listwrap">
+    <table>
+      <thead><tr><th>#</th><th>time</th><th>method</th><th>status</th><th>url</th><th>via</th><th>size</th><th>ms</th><th>seal</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty">No traffic yet. LucyN is being suspiciously quiet. Make her <code>visit</code> something.</div>
+  </div>
+  <aside id="detail" hidden></aside>
+</div>
+
+<script>
+"use strict";
+(function () {
+  var MAX_ROWS = 1000;
+  var items = [];            // {env: string, cap: object, seal: 'unk'|'ok'|'bad', tr: Element}
+  var byId = Object.create(null);
+  var pendingQ = [];
+  var paused = false, selected = null, ws = null, retry = 0;
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);   // textContent ONLY: captured data is untrusted
+    return e;
+  }
+  function pad(n, w) { n = String(n); while (n.length < w) n = "0" + n; return n; }
+  function clock(ms) { var d = new Date(ms); return pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2) + "." + pad(d.getMilliseconds(), 3); }
+  function human(n) { if (n < 1024) return n + " B"; if (n < 1048576) return (n / 1024).toFixed(1) + " KB"; return (n / 1048576).toFixed(1) + " MB"; }
+  function statusClass(c) { return c ? "s" + String(Math.floor(c.status / 100)) : "s0"; }
+  function statusText(c) { return c.error && !c.status ? "ERR" : String(c.status); }
+  function shortUrl(u) { return u.replace(/^https?:\/\//, ""); }
+
+  // ---------------------------------------------------------------- ingest
+  function ingest(envText) {
+    var env, cap;
+    try { env = JSON.parse(envText); cap = JSON.parse(env.payload); } catch (e) { return; }
+    if (!cap || typeof cap.id !== "number" || byId[cap.id]) return;
+    if (paused) { pendingQ.push(envText); updatePending(); return; }
+    var it = { env: envText, cap: cap, seal: "unk", tr: null };
+    byId[cap.id] = it;
+    items.push(it);
+    addRow(it);
+    while (items.length > MAX_ROWS) { var old = items.shift(); delete byId[old.cap.id]; if (old.tr && old.tr.parentNode) old.tr.parentNode.removeChild(old.tr); if (selected === old) closeDetail(); }
+    $("n").textContent = items.length;
+    $("empty").hidden = true;
+  }
+  function updatePending() { $("pending").textContent = pendingQ.length; $("pendingwrap").hidden = pendingQ.length === 0; }
+
+  function addRow(it) {
+    var c = it.cap, tr = el("tr", "row");
+    tr.appendChild(el("td", null, c.id));
+    tr.appendChild(el("td", null, clock(c.ts)));
+    tr.appendChild(el("td", null, c.method));
+    tr.appendChild(el("td", statusClass(c), statusText(c)));
+    var u = el("td", "url", shortUrl(c.url)); u.title = c.url; tr.appendChild(u);
+    tr.appendChild(el("td", null, c.profile ? (c.impersonating ? c.profile : c.profile + " (no)") : "-"));
+    tr.appendChild(el("td", null, human(c.bodyBytes)));
+    tr.appendChild(el("td", null, Math.round(c.timing.totalMs)));
+    it.sealTd = el("td", "seal-unk", "?");
+    tr.appendChild(it.sealTd);
+    tr.addEventListener("click", function () { select(it); });
+    it.tr = tr;
+    applyFilter(it);
+    var wrap = $("listwrap");
+    var stick = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 30;
+    $("rows").appendChild(tr);
+    if (stick) wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  function setSeal(it, state) {
+    it.seal = state;
+    it.sealTd.className = state === "ok" ? "seal-ok" : state === "bad" ? "seal-bad" : "seal-unk";
+    it.sealTd.textContent = state === "ok" ? "\u2713" : state === "bad" ? "\u2717" : "?";
+  }
+
+  // ---------------------------------------------------------------- filter
+  function applyFilter(it) {
+    var f = $("filter").value.trim().toLowerCase();
+    if (!f) { it.tr.style.display = ""; return; }
+    var c = it.cap, hay = (c.method + " " + statusText(c) + " " + c.url + " " + c.profile).toLowerCase();
+    it.tr.style.display = hay.indexOf(f) >= 0 ? "" : "none";
+  }
+  $("filter").addEventListener("input", function () { items.forEach(applyFilter); });
+
+  // ---------------------------------------------------------------- detail
+  function kv(parent, pairs) {
+    var g = el("div", "kv");
+    pairs.forEach(function (p) { g.appendChild(el("div", null, p[0])); var v = el("div"); if (p[1] instanceof Element) v.appendChild(p[1]); else v.textContent = String(p[1]); g.appendChild(v); });
+    parent.appendChild(g);
+  }
+  function headers(parent, list) {
+    if (!list.length) { parent.appendChild(el("div", "seal-unk", "(none captured)")); return; }
+    var t = el("table", "hdrs");
+    list.forEach(function (h) { var r = el("tr"); r.appendChild(el("td", null, h[0])); r.appendChild(el("td", null, h[1])); t.appendChild(r); });
+    parent.appendChild(t);
+  }
+  function timing(parent, t) {
+    var rows = [["dns", t.dnsMs], ["connect", t.connectMs], ["tls", t.tlsMs], ["first byte", t.firstByteMs], ["total", t.totalMs]];
+    var max = Math.max(1, t.totalMs);
+    var g = el("div", "kv");
+    rows.forEach(function (r) {
+      g.appendChild(el("div", null, r[0]));
+      var cell = el("div"); var bar = el("div", "bar"); bar.style.width = Math.max(1, (r[1] / max) * 100) + "%";
+      cell.appendChild(bar); cell.appendChild(el("span", "seal-unk", r[1].toFixed(1) + " ms")); g.appendChild(cell);
+    });
+    parent.appendChild(g);
+  }
+
+  function select(it) {
+    if (selected && selected.tr) selected.tr.classList.remove("sel");
+    selected = it; it.tr.classList.add("sel");
+    var c = it.cap, d = $("detail");
+    d.hidden = false; d.textContent = "";
+    var x = el("button", "close", "close"); x.addEventListener("click", closeDetail); d.appendChild(x);
+
+    d.appendChild(el("h2", null, "Request #" + c.id));
+    var who = el("span");
+    who.appendChild(document.createTextNode(c.profile || "none"));
+    who.appendChild(el("span", "badge " + (c.impersonating ? "good" : "warn"), c.impersonating ? "wearing it" : "NOT impersonating"));
+    kv(d, [["method", c.method], ["url", c.url], ["final url", c.finalUrl], ["status", statusText(c) + (c.error ? "  (" + c.error + ")" : "")],
+           ["profile", who], ["http", c.httpVersion || "?"], ["remote", c.remoteIp ? c.remoteIp + ":" + c.remotePort : "-"],
+           ["redirects", c.redirects], ["when", new Date(c.ts).toISOString()]]);
+
+    d.appendChild(el("h2", null, "Timing"));
+    timing(d, c.timing);
+    d.appendChild(el("h2", null, "Request headers (as sent, wire order)"));
+    headers(d, c.requestHeaders);
+    d.appendChild(el("h2", null, "Response headers"));
+    headers(d, c.responseHeaders);
+
+    d.appendChild(el("h2", null, "Body  (" + human(c.bodyBytes) + (c.bodyTruncated ? ", preview truncated" : "") + (c.bodyEncoding === "base64" ? ", binary: base64" : "") + ")"));
+    d.appendChild(el("pre", null, c.body === "" ? "(empty)" : c.body));
+
+    d.appendChild(el("h2", null, "NULLBYTE seal"));
+    var sig = el("div", null, "HMAC-SHA256  " + JSON.parse(it.env).sig); sig.style.overflowWrap = "anywhere"; d.appendChild(sig);
+    var act = el("div", "row-actions");
+    var v = el("button", null, "Verify seal"), tm = el("button", null, "Tamper & verify"), cp = el("button", null, "Copy JSON"), verdict = el("span"); verdict.id = "verdict";
+    v.addEventListener("click", function () { verify(it, it.env, function (ok, why) { setSeal(it, ok ? "ok" : "bad"); say(verdict, ok, ok ? "valid: untouched since capture" : "INVALID: " + why); }); });
+    tm.addEventListener("click", function () {
+      var e = JSON.parse(it.env); e.payload = e.payload.replace('"status":' + c.status, '"status":' + (c.status === 200 ? 404 : 200)); if (e.payload === JSON.parse(it.env).payload) e.payload += " ";
+      verify(it, JSON.stringify(e), function (ok, why) { say(verdict, !ok, ok ? "uh oh: the tampered copy was ACCEPTED" : "tampered copy rejected, as it should be (" + why + ")"); });
+    });
+    cp.addEventListener("click", function () { var t = JSON.stringify(c, null, 2); if (navigator.clipboard) navigator.clipboard.writeText(t).then(function () { cp.textContent = "Copied"; }, function () {}); });
+    act.appendChild(v); act.appendChild(tm); act.appendChild(cp); act.appendChild(verdict);
+    d.appendChild(act);
+  }
+  function say(node, good, text) { node.textContent = text; node.className = good ? "seal-ok" : "seal-bad"; }
+  function closeDetail() { var d = $("detail"); d.hidden = true; d.textContent = ""; if (selected && selected.tr) selected.tr.classList.remove("sel"); selected = null; }
+
+  // ---------------------------------------------------------------- verify
+  function verify(it, envText, cb) {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/verify");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onload = function () { try { var r = JSON.parse(xhr.responseText); cb(!!r.ok, r.error || ""); } catch (e) { cb(false, "bad reply"); } };
+    xhr.onerror = function () { cb(false, "server unreachable"); };
+    xhr.send(envText);
+  }
+  $("verifyall").addEventListener("click", function () {
+    var b = $("verifyall"), todo = items.filter(function (i) { return i.tr.style.display !== "none"; }), done = 0;
+    b.disabled = true;
+    (function next() {
+      if (!todo.length) { b.disabled = false; b.textContent = "Verify all seals"; return; }
+      var it = todo.shift();
+      b.textContent = "Verifying " + (++done) + "...";
+      verify(it, it.env, function (ok) { setSeal(it, ok ? "ok" : "bad"); next(); });
+    })();
+  });
+
+  // ---------------------------------------------------------------- controls
+  $("pause").addEventListener("click", function () {
+    paused = !paused; $("pause").textContent = paused ? "Resume" : "Pause";
+    if (!paused) { var q = pendingQ; pendingQ = []; updatePending(); q.forEach(ingest); }
+  });
+  $("clear").addEventListener("click", function () {
+    items = []; byId = Object.create(null); pendingQ = []; updatePending(); closeDetail();
+    $("rows").textContent = ""; $("n").textContent = "0"; $("empty").hidden = false;
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { closeDetail(); return; }
+    if ((e.key === "ArrowDown" || e.key === "ArrowUp") && document.activeElement !== $("filter") && items.length) {
+      var vis = items.filter(function (i) { return i.tr.style.display !== "none"; });
+      var at = vis.indexOf(selected), n = e.key === "ArrowDown" ? Math.min(vis.length - 1, at + 1) : Math.max(0, at - 1);
+      if (vis[n]) { select(vis[n]); vis[n].tr.scrollIntoView({ block: "nearest" }); e.preventDefault(); }
+    }
+  });
+
+  // ---------------------------------------------------------------- transport
+  function loadHistory() {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/api/captures?limit=200");
+    xhr.onload = function () { try { JSON.parse(xhr.responseText).forEach(function (env) { ingest(JSON.stringify(env)); }); } catch (e) {} };
+    xhr.send();
+  }
+  function connect() {
+    var sock = new WebSocket("ws://" + location.host + "/stream");
+    ws = sock;
+    sock.onopen = function () { retry = 0; $("dot").className = "live"; $("conn").textContent = "live"; loadHistory(); };
+    sock.onmessage = function (m) { ingest(m.data); };
+    sock.onclose = function () {
+      $("dot").className = ""; $("conn").textContent = "disconnected - retrying";
+      setTimeout(connect, Math.min(5000, 500 * Math.pow(2, retry++)));
+    };
+    sock.onerror = function () { try { sock.close(); } catch (e) {} };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

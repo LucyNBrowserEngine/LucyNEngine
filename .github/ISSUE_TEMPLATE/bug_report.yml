@@ -1,0 +1,78 @@
+name: Bug report
+description: Report incorrect or broken LucyN behavior.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: Please check existing issues first. Include enough detail to reproduce the problem.
+  - type: dropdown
+    id: modules
+    attributes:
+      label: Which module or area is affected?
+      description: LucyN is modular. Select every relevant module; choose Cross-module for wiring spanning several modules.
+      multiple: true
+      options:
+        - modules/adblock
+        - modules/controller
+        - modules/core
+        - modules/dom
+        - modules/js
+        - modules/layout
+        - modules/logger
+        - modules/net
+        - modules/paint
+        - modules/profile
+        - modules/security
+        - modules/server
+        - modules/shell
+        - modules/ui
+        - apps/lucyn
+        - client
+        - dashboard
+        - Build or repository configuration
+        - Documentation
+        - Cross-module / app-wide
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: module_context
+    attributes:
+      label: Module details
+      description: If you chose Cross-module or Not sure, describe the affected flow or component.
+      placeholder: e.g. modules/net request filtering as called by modules/controller
+    validations:
+      required: false
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Include the behavior you observed and what you expected instead.
+      placeholder: Describe actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure or run ...
+        2. Execute ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: LucyN version or commit
+      placeholder: e.g. current branch / commit hash
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Include relevant output, error messages, or screenshots. Remove secrets and private data.
+      render: text
+    validations:
+      required: false

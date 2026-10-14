@@ -1,0 +1,19 @@
+stb (single-header C libraries) — Sean Barrett / RAD Game Tools and contributors
+Source: https://github.com/nothings/stb
+Fetched: 13 Oct 2026, from the `master` branch (sandbox could not resolve the exact
+commit SHA via api.github.com this session — re-pin to a commit when the author
+next updates these files).
+
+Files vendored, unmodified:
+  stb_truetype.h     v1.26 — TrueType font rasterization (used by modules/paint for DrawText)
+  stb_image.h        (version header in file) — image decoding (used by modules/paint, DrawImage)
+  stb_image_write.h  (version header in file) — PNG encoding (used by modules/paint, PNG output)
+
+License: Public Domain (or MIT, your choice) — see the license block at the end of
+each file ("This software is available under 2 licenses ... choose whichever you
+prefer"). No attribution required, but kept here per project habit (same as
+quickjs/mongoose).
+
+These are "STB_*_IMPLEMENTATION" style headers: exactly one .cpp in modules/paint
+defines STB_TRUETYPE_IMPLEMENTATION / STB_IMAGE_IMPLEMENTATION / STB_IMAGE_WRITE_IMPLEMENTATION
+before including them, so the implementation is compiled exactly once.

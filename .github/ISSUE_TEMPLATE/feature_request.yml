@@ -1,0 +1,67 @@
+name: Feature request
+description: Propose a feature or improvement for LucyN.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: Describe the user need and the module that should own the change. LucyN is built from modules that can be developed independently.
+  - type: dropdown
+    id: modules
+    attributes:
+      label: Which module or area should be updated?
+      description: Select every relevant module. Use Cross-module / app-wide if the feature needs coordinated changes, or Not sure if you want help identifying ownership.
+      multiple: true
+      options:
+        - modules/adblock
+        - modules/controller
+        - modules/core
+        - modules/dom
+        - modules/js
+        - modules/layout
+        - modules/logger
+        - modules/net
+        - modules/paint
+        - modules/profile
+        - modules/security
+        - modules/server
+        - modules/shell
+        - modules/ui
+        - apps/lucyn
+        - client
+        - dashboard
+        - Build or repository configuration
+        - Documentation
+        - Cross-module / app-wide
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem should this solve?
+      placeholder: Explain the task or limitation from the user's perspective.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe how the feature should work, including an example if useful.
+      placeholder: What should LucyN do after this change?
+    validations:
+      required: true
+  - type: textarea
+    id: module_notes
+    attributes:
+      label: Module boundaries or dependencies
+      description: Note any modules this should depend on, APIs it should expose, or existing behavior it must preserve.
+      placeholder: Optional. For example, modules/controller should configure modules/net without making the adblock module depend on the app.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: Optional
+    validations:
+      required: false

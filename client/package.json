@@ -1,0 +1,15 @@
+{
+  "name": "nothing-browser",
+  "version": "0.7.0",
+  "description": "JS client for the LucyN headless browser engine (M7)",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["browser", "headless", "scraper", "lucyn", "nothing-browser"],
+  "license": "MIT"
+}

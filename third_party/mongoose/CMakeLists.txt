@@ -1,0 +1,26 @@
+# Mongoose, vendored (plain C). Static library; see VENDORED.txt for the license warning.
+cmake_minimum_required(VERSION 3.16)
+if(NOT TARGET lucyn_mongoose)
+  if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(lucyn_mongoose_vendor LANGUAGES C)
+  else()
+    enable_language(C)
+  endif()
+  add_library(lucyn_mongoose STATIC mongoose.c)
+  add_library(lucyn::mongoose ALIAS lucyn_mongoose)
+  target_include_directories(lucyn_mongoose PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  # PUBLIC: struct layouts must match in mongoose.c and in every includer.
+  # MG_ENABLE_LOG=0: the default logger prints to stdout, which is LucyN's protocol channel.
+  target_compile_definitions(lucyn_mongoose PUBLIC MG_ENABLE_LOG=0)
+  set_target_properties(lucyn_mongoose PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
+  if(WIN32)
+    target_link_libraries(lucyn_mongoose PUBLIC ws2_32)
+  endif()
+  find_package(Threads)
+  if(Threads_FOUND)
+    target_link_libraries(lucyn_mongoose PUBLIC Threads::Threads)
+  endif()
+  if(NOT MSVC)
+    target_compile_options(lucyn_mongoose PRIVATE -w)   # upstream code: not ours to fix
+  endif()
+endif()

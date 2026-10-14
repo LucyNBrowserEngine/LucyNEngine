@@ -1,0 +1,16 @@
+# Turns src/prelude/p*.js (in name order) into a C++ include: a run of adjacent raw string literals, each <= 8000 bytes
+# (MSVC rejects longer literals). Adjacent literals concatenate, so the C++ side sees one string. Files must be ASCII.
+file(GLOB parts "${DIR}/p*.js")
+list(SORT parts)
+set(out "")
+foreach(f IN LISTS parts)
+  file(READ "${f}" content)
+  string(LENGTH "${content}" len)
+  set(pos 0)
+  while(pos LESS len)
+    string(SUBSTRING "${content}" ${pos} 8000 slice)
+    string(APPEND out "R\"JSRAW(${slice})JSRAW\"\n")
+    math(EXPR pos "${pos} + 8000")
+  endwhile()
+endforeach()
+file(WRITE "${OUT}" "${out}")

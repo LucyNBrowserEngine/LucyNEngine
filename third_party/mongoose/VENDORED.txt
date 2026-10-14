@@ -1,0 +1,13 @@
+Mongoose 7.23 (https://github.com/cesanta/mongoose, tag 7.23), vendored unmodified:
+  mongoose.c  mongoose.h  LICENSE
+Source: https://codeload.github.com/cesanta/mongoose/tar.gz/refs/tags/7.23
+
+LICENSE WARNING: Mongoose is dual-licensed GPL-2.0-only OR a paid commercial license from Cesanta.
+Linking it into LucyN means the combined binary must be distributed under GPL-2.0 terms, unless you
+buy the commercial license (https://www.mongoose.ws/licensing/). Decide before you ship binaries.
+
+Build notes (see CMakeLists.txt next to this file):
+  * MG_ENABLE_LOG=0 for BOTH mongoose.c and every file that includes mongoose.h. Mongoose's default
+    logger writes to stdout, and in `lucyn` stdout is the JSON protocol channel.
+  * Do not edit the vendored sources. To upgrade: download the new tag, replace the 3 files, bump this file,
+    run the `server` suite.

@@ -1,0 +1,19 @@
+changelog:
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking-change
+    - title: Features and improvements
+      labels:
+        - enhancement
+        - feature
+    - title: Fixes
+      labels:
+        - bug
+        - bugfix
+    - title: Module updates
+      labels:
+        - module
+    - title: Other changes
+      labels:
+        - "*"
