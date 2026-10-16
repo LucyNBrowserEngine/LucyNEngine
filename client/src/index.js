@@ -73,6 +73,7 @@ class LucynSession extends EventEmitter {
    * @param {boolean} [opts.adblock=true]           enable the built-in request blocker
    * @param {string} [opts.adblockList]              additional ABP/uBO-format rule file
    * @param {string} [opts.binary]                  path to the `lucyn` binary
+   * @param {string} [opts.config]                  engine JSON config (search defaults, LNM entry)
    * @param {boolean|object} [opts.moonbug]         start Moonbug listeners with the engine:
    *        true = defaults (raw 2005, signed 2006, dashboard 6969), or { raw, signed, dashboard, dashboardFile }
    *        where each port is a number (0 = any free port). All bind 127.0.0.1 only.
@@ -81,6 +82,7 @@ class LucynSession extends EventEmitter {
    *        same way — layout/paint don't need a window at all — this only affects whether an SDL window
    *        object exists from the first instant versus being created lazily on first use. Needs an SDL2
    *        build of the engine; harmless (just ignored, headless as always) otherwise.
+   * @param {boolean} [opts.show=false]              create and show the SDL window at startup
    */
   constructor(opts = {}) {
     super();
@@ -92,6 +94,8 @@ class LucynSession extends EventEmitter {
     this._adblock          = opts.adblock ?? true;
     this._adblockList      = opts.adblockList ?? "";
     this._ghostful        = opts.ghostful ?? false;
+    this._show            = opts.show ?? false;
+    this._config          = opts.config ?? "";
     this._binary          = findBinary(opts.binary);
     this._proc            = null;
     this._rl              = null;
@@ -115,6 +119,8 @@ class LucynSession extends EventEmitter {
     if (!this._adblock) args.push("--no-adblock");
     if (this._adblockList) args.push("--adblock-list", this._adblockList);
     if (this._ghostful) args.push("--ghostful");
+    if (this._show) args.push("--show");
+    if (this._config) args.push("--config", this._config);
     // The client always asks for capture events: they cost nothing until a listener is attached (see Moonbug below)
     // and a late-attached onRequest() must not miss the very first request.
     args.push("--events");
@@ -218,6 +224,30 @@ class LucynSession extends EventEmitter {
   async visit(url, opts = {}) {
     const cmd = { cmd: "visit", url };
     if (opts.profile) cmd.profile = opts.profile;
+    const r = await this._send(cmd);
+    return { status: r.status, url: r.url, title: r.title };
+  }
+
+  /**
+   * Open a website in LucyN. This is the same navigation pipeline as visit().
+   * @param {string} url  http:// or https:// URL
+   * @param {object} [opts]
+   * @returns {Promise<{status:number, url:string, title:string}>}
+   */
+  async open(url, opts = {}) {
+    return this.visit(url, opts);
+  }
+
+  /**
+   * Open a provider's normal search results page in LucyN.
+   * @param {string} query
+   * @param {object} [opts]
+   * @param {string} [opts.engine]  provider id; defaults to engine config (Brave by default)
+   * @returns {Promise<{status:number, url:string, title:string}>}
+   */
+  async search(query, opts = {}) {
+    const cmd = { cmd: "search", query };
+    if (opts.engine) cmd.engine = opts.engine;
     const r = await this._send(cmd);
     return { status: r.status, url: r.url, title: r.title };
   }

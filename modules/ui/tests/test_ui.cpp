@@ -3,7 +3,9 @@
 // real display. What it CANNOT verify: anything a human eye would judge —
 // an actual window appearing on a real desktop, real mouse/keyboard input,
 // real resize dragging. See SESSION11.md's "NOT verified" list.
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <lucyn/paint/framebuffer.h>
 #include <lucyn/ui/window.h>
 
@@ -61,6 +63,33 @@ int main() {
         Window w;
         auto events = w.pollEvents();
         CHECK(events.empty());
+    }
+
+    // 6. Session 16: the window lives on its own UI thread. present() from a
+    // different thread than create() must be safe, a window can be re-created
+    // (the controller's resize path), and events/frames queued while the
+    // owner is "busy" are not lost or crashing.
+    {
+        Window w;
+        CHECK(w.create(80, 60, "thread test", false));
+        lucyn::paint::Framebuffer fb;
+        fb.init(80, 60, lucyn::paint::packRGBA(200, 100, 50, 255));
+        std::thread t([&] { for (int i = 0; i < 50; ++i) w.present(fb); });
+        for (int i = 0; i < 50; ++i) (void)w.pollEvents();
+        t.join();
+        CHECK(w.create(120, 90, "recreated", true));      // destroy + create on the UI thread
+        CHECK(w.visible() == true);
+        CHECK(w.width() == 120 && w.height() == 90);
+        w.present(fb);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));  // let the UI thread blit/redraw
+        w.setVisible(false);
+        CHECK(w.visible() == false);
+    }
+
+    // 7. Creating and destroying many windows in a row must not hang or leak the UI thread.
+    for (int i = 0; i < 10; ++i) {
+        Window w;
+        CHECK(w.create(32, 32, "churn", i % 2 == 0));
     }
 
     if (failures) {

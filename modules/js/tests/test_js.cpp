@@ -390,7 +390,12 @@ int main() {
         CHECK_EQ(r.ev("(()=>{location.hash='top';return location.hash})()"), "#top");
         CHECK(r.host.notes().empty());
         CHECK(r.run("location.href = 'https://elsewhere.test/'; location.assign('/other');").ok);
-        CHECK(r.host.notes().size() == 2 && r.host.notes()[0].find("elsewhere.test") != std::string::npos);   // says so, does not pretend
+        {   // the page asked to leave: recorded (newest wins), not followed, not "ignored"
+            auto nav = r.host.takeNavigation();
+            CHECK(nav && nav->method == "GET" && nav->url.find("/other") != std::string::npos && nav->url.find("elsewhere.test") == std::string::npos);
+            CHECK(!r.host.takeNavigation());                                          // taking it clears it
+            CHECK(r.host.notes().empty());
+        }
         CHECK_EQ(r.ev("location.hostname"), "site.test");
         CHECK_EQ(r.ev("(()=>{const u=new URL('../x/y?a=1&b=2#h','https://e.com/p/q/r');u.searchParams.append('c','3 4');u.hash='';return u.href+'|'+u.searchParams.get('b')+'|'+u.origin})()"), "https://e.com/p/x/y?a=1&b=2&c=3+4|2|https://e.com");
         CHECK_EQ(r.ev("(()=>{try{new URL('nope')}catch(e){return e.name}})()"), "TypeError");
@@ -510,6 +515,90 @@ int main() {
         for (auto& s : res.scripts) if (s.name == "hang" && s.detail.find("timed out") != std::string::npos) hung = true;
         CHECK(hung);
         CHECK(host.pageErrors().empty());
+    }
+
+    // ---- page navigation: reload / href / forms / link clicks / noscript / settle ----------------------------------------------------
+    {
+        Rig r;
+        r.mount("<a id=l href=\"/next?x=1#top\">go</a><a id=js href=\"javascript:void(0)\">j</a><a id=dl href=\"/f.zip\" download>d</a>"
+                "<a id=mail href=\"mailto:a@b.c\">m</a>"
+                "<form id=g action=\"/s?old=1\" method=\"get\"><input name=q value=\"a b&c\"><input name=skip disabled value=no>"
+                "<button id=b type=submit name=go value=1>Go</button></form>"
+                "<form id=p action=\"/post\" method=\"POST\"><input name=q value=\"x\"></form>");
+        // reload keeps the URL, drops the fragment
+        CHECK(r.run("location.reload();").ok);
+        { auto n = r.host.takeNavigation(); CHECK(n && n->method == "GET" && n->url == "https://site.test/p/index.html"); }
+        // a fragment-only change is NOT a navigation; a same-URL assignment without a fragment IS (it reloads)
+        CHECK(r.run("location.href = '#x'; location.hash = 'y';").ok);
+        CHECK(!r.host.takeNavigation());
+        CHECK(r.run("location.href = location.href.split('#')[0];").ok);
+        CHECK(r.host.takeNavigation().has_value());
+        // location.search / pathname setters navigate
+        CHECK(r.run("location.search = 'q=1';").ok);
+        { auto n = r.host.takeNavigation(); CHECK(n); if (n) CHECK_EQ(n->url, "https://site.test/p/index.html?q=1#y"); }   // the hash set above stays, like a browser
+        CHECK(r.run("location.pathname = 'z';").ok);
+        { auto n = r.host.takeNavigation(); CHECK(n); if (n) CHECK_EQ(n->url, "https://site.test/z#y"); }
+        // link click: default action follows; javascript:/download/mailto do not
+        CHECK(r.run("document.getElementById('l').click();").ok);
+        { auto n = r.host.takeNavigation(); CHECK(n && n->url == "https://site.test/next?x=1#top"); }
+        CHECK(r.run("document.getElementById('js').click(); document.getElementById('dl').click();").ok);
+        CHECK(!r.host.takeNavigation());
+        CHECK(r.run("document.getElementById('mail').click();").ok);
+        CHECK(!r.host.takeNavigation());
+        { bool said = false; for (auto& n : r.host.notes()) if (n.find("mailto:") != std::string::npos) said = true; CHECK(said); }
+        // preventDefault cancels the default action
+        CHECK(r.run("document.getElementById('l').addEventListener('click', e => e.preventDefault()); document.getElementById('l').click();").ok);
+        CHECK(!r.host.takeNavigation());
+        // GET form via its submit button: action's old query replaced, fields urlencoded, disabled skipped, submitter included
+        CHECK(r.run("document.getElementById('b').click();").ok);
+        { auto n = r.host.takeNavigation(); CHECK(n && n->method == "GET"); if (n) CHECK_EQ(n->url, "https://site.test/s?q=a+b%26c&go=1"); }
+        // submit event can cancel requestSubmit(); form.submit() fires no event at all
+        CHECK(r.run("const g = document.getElementById('g'); g.addEventListener('submit', e => e.preventDefault()); g.requestSubmit();").ok);
+        CHECK(!r.host.takeNavigation());
+        CHECK(r.run("document.getElementById('g').submit();").ok);
+        CHECK(r.host.takeNavigation().has_value());
+        // POST form
+        CHECK(r.run("document.getElementById('p').submit();").ok);
+        { auto n = r.host.takeNavigation();
+          CHECK(n && n->method == "POST" && n->url == "https://site.test/post" && n->body == "q=x" && n->contentType == "application/x-www-form-urlencoded"); }
+        // newest wins
+        CHECK(r.run("location.href = '/one'; location.href = '/two';").ok);
+        { auto n = r.host.takeNavigation(); CHECK(n && n->url == "https://site.test/two"); }
+        CHECK(r.host.notes().size() == 1);                              // only the mailto: note
+    }
+    {   // a page that leaves stops running its remaining scripts and settle() returns at once
+        ScriptRegistry sr;
+        js::QuickJsHost host;
+        const char* page = R"(<!doctype html><html><head></head><body><div id="o"></div>
+<script>document.getElementById('o').setAttribute('a','1'); setTimeout(function(){ location.reload(); }, 5);</script>
+<script>setTimeout(function(){ document.getElementById('o').setAttribute('late','1'); }, 400);</script></body></html>)";
+        Hydrator hy(fetchOf(page), sr, host);
+        hy.options.saveSnapshots = false;
+        hy.options.keepAlive = true;
+        auto t0 = std::chrono::steady_clock::now();
+        auto res = hy.hydrate("https://site.test/c.html");
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(res.ok && res.jsAvailable);
+        CHECK(res.afterHtml.find("a=\"1\"") != std::string::npos);
+        CHECK(res.afterHtml.find("late=") == std::string::npos);        // the 400 ms timer never ran: the page was already leaving
+        CHECK(ms < 350);
+        auto nav = host.takeNavigation();
+        CHECK(nav && nav->url == "https://site.test/c.html");
+    }
+    {   // <noscript> content is not part of a page that runs scripts (gumbo would otherwise render it)
+        ScriptRegistry sr;
+        js::QuickJsHost host;
+        const char* page = R"(<!doctype html><html><head><noscript>JavaScript is required to complete this challenge.</noscript></head>
+<body><p id="p">hi</p><noscript><div id="ns">Enable JS</div></noscript>
+<script>var s = '<noscript>x</noscript>'; document.getElementById('p').setAttribute('s', s);</script></body></html>)";
+        Hydrator hy(fetchOf(page), sr, host);
+        hy.options.saveSnapshots = false;
+        auto res = hy.hydrate("https://site.test/n.html");
+        CHECK(res.ok && res.jsAvailable);
+        CHECK(res.afterHtml.find("JavaScript is required") == std::string::npos);
+        CHECK(res.afterHtml.find("id=\"ns\"") == std::string::npos);
+        CHECK(res.afterHtml.find("<noscript>x</noscript>") != std::string::npos);   // a "<noscript>" inside a JS string is left alone
+        CHECK(res.beforeHtml.find("JavaScript is required") != std::string::npos);  // the fetched source is untouched
     }
 
     fs::remove_all(tmp);

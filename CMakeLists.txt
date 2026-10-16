@@ -19,7 +19,10 @@ option(LUCYN_MODULE_SERVER   "Server module (TinyElysia on vendored Mongoose + M
 option(LUCYN_MODULE_JS      "JS module (QuickJS + DOM bridge: the real script host for the shell)" ON)
 option(LUCYN_MODULE_PAINT   "Paint module (display list + SoftwarePainter; stb_truetype/stb_image, no SDL)" ON)
 option(LUCYN_MODULE_LAYOUT  "Layout module (block/inline box tree -> display list; needs dom + paint)" ON)
+option(LUCYN_MODULE_LNM     "LNM interpreter (lnminterpreter/: parser + styled-DOM compiler + view switching; needs dom + paint + layout)" ON)
+option(LUCYN_MODULE_SEARCH  "Search provider registry (free web search URL templates)" ON)
 option(LUCYN_MODULE_UI      "UI module (SDL2 window + Ghostful Mode; builds only if SDL2 is found)" ON)
+option(LUCYN_LITEHTML       "Vendor litehtml for full CSS colour/image rendering (SESSION17+)" ON)
 
 # All tools land in build/bin, so they share ONE nothing-data folder (build/bin/nothing-data).
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
@@ -28,8 +31,20 @@ endif()
 
 enable_testing()
 
+# Vendor litehtml + bundled gumbo FIRST — dom module falls back to lucyn::gumbo
+# if libgumbo-dev is not installed on the host.
+if(LUCYN_LITEHTML AND LUCYN_MODULE_LAYOUT AND LUCYN_MODULE_DOM AND LUCYN_MODULE_PAINT)
+  if(NOT TARGET litehtml)
+    add_subdirectory(third_party/litehtml)
+  endif()
+endif()
+
 if(LUCYN_MODULE_CORE)
   add_subdirectory(modules/core)       # first: profile and shell use it
+endif()
+
+if(LUCYN_MODULE_SEARCH)
+  add_subdirectory(modules/search)
 endif()
 
 if(LUCYN_MODULE_LOGGER)
@@ -87,6 +102,11 @@ if(LUCYN_MODULE_LAYOUT AND LUCYN_MODULE_DOM AND LUCYN_MODULE_PAINT)
     target_compile_definitions(lucyn-paint PRIVATE LUCYN_PAINT_HAVE_LAYOUT_DOM=1)
   endif()
 endif()
+# Session 12: LNM. Lives in lnminterpreter/ (next to modules/, the author's choice); it is shaped like a module
+# (include/lucyn/lnm, src, tools, tests, standalone CMakeLists) so moving it to modules/lnm/ is a rename.
+if(LUCYN_MODULE_LNM AND TARGET lucyn::layout)
+  add_subdirectory(lnminterpreter)
+endif()
 if(LUCYN_MODULE_UI AND LUCYN_MODULE_PAINT)
   add_subdirectory(modules/ui)   # silently skips itself (message + return()) if SDL2 is missing
 endif()
@@ -121,5 +141,9 @@ if(LUCYN_MODULE_CONTROLLER
   if(TARGET lucyn_controller AND TARGET lucyn::ui)
     target_link_libraries(lucyn_controller PRIVATE lucyn::ui)
     target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_UI=1)
+  endif()
+  if(TARGET lucyn_controller AND TARGET lucyn::lnm)
+    target_link_libraries(lucyn_controller PRIVATE lucyn::lnm)
+    target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_LNM=1)
   endif()
 endif()

@@ -113,7 +113,7 @@ for the attached page and does not implement ServiceWorker/offline behavior.
 - Selectors are whatever `lucyn::dom` supports (no `:not`, `:first-child`, `[a^=b]`). An unsupported selector matches nothing, silently.
 - No layout: `offsetWidth`, `getBoundingClientRect()` etc. are honestly zero; `getComputedStyle` has no cascade.
 - `navigator.plugins/mimeTypes/connection/getBattery/mediaDevices`, `window.chrome`, `Notification`, `Intl` quirks: not done.
-- Navigation (`location.href = other`, `assign`, `reload`) is **ignored and noted**; only hash changes apply.
+- Page navigation (`location.href = other`, `assign`, `reload`) is **ignored and noted**; only hash changes apply. Use the Node client’s `open(url)` or `search(query)` methods to navigate the engine.
 - `window.innerHeight` is `availHeight - 85`: an invented constant for browser chrome. Replace it when real UI exists.
 - Stack-trace/error text is QuickJS's, not Chrome-shaped.
 - After a runaway microtask loop the queue is cut off per drain but not emptied (QuickJS has no API for that); the next drain cuts it again.

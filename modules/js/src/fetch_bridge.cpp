@@ -395,53 +395,122 @@ void pumpFetch(State& s) {
     drainFetch(s);
 }
 
-// Called from host.cpp::runScriptNode when a <script src> is found:
-// downloads synchronously (blocks the JS engine, which is idle waiting for settle() anyway),
-// evals the source, and saves the real content to loadedfiles.
-bool fetchAndRunScript(State& s, const std::string& absUrl, std::string* err) {
-    std::string body;
+// Fetch source code for a script (HTTP or file://). Returns false only on a hard failure; missing
+// remote files are non-fatal (return true with empty body, like a 404'd classic script). `note`
+// receives engine notes for the operator; `err` receives the error string thrown back to the caller
+// for diagnostic logs. Used by both classic <script src> and <script type="module" src> paths,
+// and by the QuickJS module loader for `import` resolution.
+bool fetchScriptSource(State& s, const std::string& absUrl, std::string& body, std::string* err) {
     bool isLocal = absUrl.rfind("file://", 0) == 0;
-
     if (isLocal) {
-        // file:// - read directly from disk, no curl needed
         std::string path = absUrl.substr(7);   // strip "file://"
         std::ifstream f(path, std::ios::binary);
-        if (!f) {
-            s.addNote("<script src> file not found: " + absUrl);
-            return true;   // missing local file is non-fatal (same as 404'd remote script)
-        }
+        if (!f) { s.addNote("script file not found: " + absUrl); return true; }
         body.assign(std::istreambuf_iterator<char>(f), {});
-    } else {
-        HttpFns fns = fnsOf(s.opts);
-        if (!fns.any()) {
-            writeLoadedFile(absUrl, "");
-            s.addNote("<script src> not loaded (no HTTP callback wired): " + absUrl);
-            return true;
-        }
-        HttpRequest rq;                  // a classic <script src>: no-cors, destination "script"
-        rq.url = absUrl;
-        rq.pageUrl = s.pageUrl;
-        rq.mode = "no-cors";
-        rq.dest = "script";
-        auto resp = runHttp(fns, rq);
-        if (!resp.error.empty()) {
-            writeLoadedFile(absUrl, "");
-            s.addNote("<script src> fetch failed (" + resp.error + "): " + absUrl);
-            return true;
-        }
-        if (resp.status < 200 || resp.status >= 300) {
-            writeLoadedFile(absUrl, "");
-            s.addNote("<script src> HTTP " + std::to_string(resp.status) + ": " + absUrl);
-            return true;
-        }
-        body = std::move(resp.body);
-        writeLoadedFile(absUrl, body);
+        return true;
     }
+    HttpFns fns = fnsOf(s.opts);
+    if (!fns.any()) {
+        writeLoadedFile(absUrl, "");
+        s.addNote("script not loaded (no HTTP callback wired): " + absUrl);
+        return true;
+    }
+    HttpRequest rq;
+    rq.url      = absUrl;
+    rq.pageUrl   = s.pageUrl;
+    rq.mode     = "no-cors";
+    rq.dest     = "script";
+    auto resp = runHttp(fns, rq);
+    if (!resp.error.empty()) {
+        writeLoadedFile(absUrl, "");
+        s.addNote("script fetch failed (" + resp.error + "): " + absUrl);
+        if (err) *err = resp.error;
+        return true;   // a missing remote script is non-fatal
+    }
+    if (resp.status < 200 || resp.status >= 300) {
+        writeLoadedFile(absUrl, "");
+        s.addNote("script HTTP " + std::to_string(resp.status) + ": " + absUrl);
+        if (err) *err = "HTTP " + std::to_string(resp.status);
+        return true;
+    }
+    body = std::move(resp.body);
+    writeLoadedFile(absUrl, body);
+    return true;
+}
 
-    // eval
+// Called from host.cpp::runScriptNode when a <script src> is found:
+// downloads synchronously (blocks the JS engine, which is idle waiting for settle() anyway),
+// evals the source as a classic global script, and saves the real content to loadedfiles.
+bool fetchAndRunScript(State& s, const std::string& absUrl, std::string* err) {
+    std::string body;
+    if (!fetchScriptSource(s, absUrl, body, err)) return false;
+    if (body.empty()) return true;
     bool ok = s.evalGlobal(body, absUrl, err);
     if (!ok) s.addError("<script src> " + absUrl + ": " + (err ? *err : ""));
     return ok;
+}
+
+// Same as fetchAndRunScript but evaluates the source as an ES module. Used for
+// <script type="module" src=...>. The QuickJS module loader (installed in attach())
+// handles any `import` statements encountered in the source; for that to find the
+// module by URL, the module name passed to JS_Eval MUST be the absolute URL.
+bool fetchAndRunModuleScript(State& s, const std::string& absUrl, std::string* err) {
+    std::string body;
+    if (!fetchScriptSource(s, absUrl, body, err)) return false;
+    if (body.empty()) return true;
+    Budget b(s, s.opts.scriptTimeoutMs);
+    JSValue r = JS_Eval(s.ctx, body.c_str(), body.size(), absUrl.c_str(), JS_EVAL_TYPE_MODULE);
+    bool ok = !JS_IsException(r);
+    if (!ok) { std::string e = s.takeException(); if (err) *err = e; s.addError("<script type=module> " + absUrl + ": " + e); }
+    JS_FreeValue(s.ctx, r);
+    s.drainJobs();
+    return ok;
+}
+
+// QuickJS module loader: invoked when an ES module hits an `import` statement.
+// `module_name` is already normalized (URL-resolved) by moduleNormalize below.
+// Returns a compiled-but-not-evaluated module (JS_EVAL_FLAG_COMPILE_ONLY); QuickJS
+// handles instantiation and top-level evaluation. Failure throws a JS exception.
+JSModuleDef* moduleLoaderCb(JSContext* c, const char* module_name, void* opaque) {
+    State* s = S(c);
+    if (!s) return nullptr;
+    std::string name = module_name ? module_name : "";
+    if (name.empty()) { JS_ThrowTypeError(c, "module: empty module name"); return nullptr; }
+
+    std::string body;
+    std::string err;
+    // The loader runs synchronously inside JS_Eval — the engine is blocked, so a
+    // blocking HTTP fetch here is fine (same as <script src>).
+    if (!fetchScriptSource(*s, name, body, &err)) {
+        JS_ThrowTypeError(c, "module loader failed for %s: %s", name.c_str(), err.c_str());
+        return nullptr;
+    }
+    if (body.empty()) {
+        JS_ThrowTypeError(c, "module not loaded (empty body): %s", name.c_str());
+        return nullptr;
+    }
+    JSValue v = JS_Eval(c, body.c_str(), body.size(), name.c_str(),
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(v)) {
+        // The exception is already pending on the context — let it propagate.
+        JS_FreeValue(c, v);
+        return nullptr;
+    }
+    JSModuleDef* m = (JSModuleDef*)JS_VALUE_GET_PTR(v);
+    JS_FreeValue(c, v);
+    return m;
+}
+
+// QuickJS module normalizer: resolves an import specifier against the importing
+// module's URL using the same URL resolver as <a href>/fetch/etc. Returns a
+// malloc'd string (per QuickJS's contract); NULL throws.
+char* moduleNormalizeCb(JSContext* c, const char* base, const char* name, void* opaque) {
+    std::string b = base ? base : "";
+    std::string n = name ? name : "";
+    std::string resolved = lucyn::shell::resolveUrl(b, n);
+    char* out = js_strdup(c, resolved.c_str());
+    if (!out) JS_ThrowTypeError(c, "module: out of memory normalizing %s", n.c_str());
+    return out;
 }
 
 void teardownFetch(JSContext* ctx) {

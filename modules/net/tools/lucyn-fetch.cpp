@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     if (probe) {
         if (!net::HttpClient::impersonationBuiltIn()) {
             std::puts("Built against stock libcurl: nothing can be impersonated.\n"
-                      "Re-run cmake with -DLUCYN_CURL_IMPERSONATE_ROOT=/path/to/libcurl-impersonate");
+                      "Put libcurl-impersonate in third_party/curl-impersonate/ and re-run cmake (see third_party/README.md)");
             return 2;
         }
         int ok = 0;

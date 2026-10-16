@@ -78,6 +78,17 @@ struct HostOptions {
     std::function<void(const std::string& level, const std::string& line)> onConsole;
 };
 
+// A navigation the PAGE asked for: location.href = ..., location.assign/replace/reload(), form.submit(), a clicked link or
+// submit button. The host never follows it itself (it only owns one document); whoever drives the host (the controller)
+// takes it with takeNavigation() once the page has settled and loads the new page. This is what lets a JS challenge
+// ("compute something, set a cookie, location.reload()") finish instead of staring at its own fallback text.
+struct Navigation {
+    std::string url;                 // absolute, http(s) only
+    std::string method = "GET";      // "GET" or "POST"
+    std::string body;                // POST body
+    std::string contentType;         // POST Content-Type
+};
+
 namespace detail { struct State; }
 
 class QuickJsHost : public shell::ScriptHost {
@@ -98,6 +109,10 @@ public:
     // Returns true on success; *result = JS string representation of the value.
     // Returns false on error; *error = readable error string.
     bool eval(const std::string& code, std::string* result, std::string* error = nullptr);
+
+    // The navigation the page asked for, if any (the newest one wins, like a browser). Taking it clears it.
+    // Also makes settle() return early: a page that is leaving has nothing left to wait for.
+    std::optional<Navigation> takeNavigation();
 
     // Replace the NativeHooks pointer without detaching. Called by the controller to swap the
     // Hydrator's stack-local hooks with a longer-lived object after hydrate() returns.

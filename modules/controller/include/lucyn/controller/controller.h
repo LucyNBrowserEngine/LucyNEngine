@@ -6,6 +6,7 @@
 // Commands:
 //   {"v":1, "id":N, "cmd":"visit",   "url":"https://example.com"}
 //   {"v":1, "id":N, "cmd":"visit",   "url":"https://example.com", "profile":"safari184"}
+//   {"v":1, "id":N, "cmd":"search",  "query":"LucyN browser", "engine":"brave"}
 //   {"v":1, "id":N, "cmd":"html"}
 //   {"v":1, "id":N, "cmd":"extract", "selector":"title"}
 //   {"v":1, "id":N, "cmd":"extractAll", "selector":".price"}
@@ -44,13 +45,10 @@
 //   {"event":"request",   "id":N, "method":"GET", "url":"...", "status":200, "ms":123.4, "bytes":5678,
 //                         "error":"", "sig":"<NULLBYTE HMAC-SHA256 of that capture>"}   // only after "moonbug" on:true
 //
-// The controller is synchronous per command (one command at a time). It does NOT spawn
-// threads; settling (JS timers/fetch) happens inside visit() before the reply is sent.
-// Session 11 addition: when built with ui (LUCYN_CONTROLLER_HAVE_UI), SDL's event queue is
-// pumped once per stdin command, still on this same thread — not a timer, not a second
-// thread. Trade-off, stated plainly: a window event (close button, resize) is only noticed
-// when the next command line arrives. See modules/ui/README.md for the fuller note and the
-// documented fallback (a reader thread) if that trade-off ever stops being acceptable.
+// The controller dispatches one command at a time. With a live SDL window and real stdin,
+// a short-lived reader thread waits for the next JSON line while the main thread keeps
+// pumping SDL events; command handling and SDL calls remain on the main thread. Injected
+// streams (used by tests and embedders) keep the synchronous line reader.
 #pragma once
 #include <functional>
 #include <iosfwd>
@@ -98,6 +96,13 @@ struct ControllerOptions {
     // (silently, like showWindow) when built without ui. showWindow implies this; setting both
     // just shows instead of hides.
     bool ghostfulWindow = false;
+
+    // Optional LNM app entry configured by `lucyn --config <file>`. The entry
+    // path is resolved by the executable before it reaches the controller.
+    std::string lnmEntry;
+    // Search defaults from `engine.config.search`; SearXNG needs a user-selected instance.
+    std::string searchDefault = "brave";
+    std::string searxngUrl;
 
     // Custom in/out streams for testing. Null = use stdin/stdout.
     std::istream* in  = nullptr;

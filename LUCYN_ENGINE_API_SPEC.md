@@ -56,6 +56,22 @@ engine.config.lnm.entry = "./ui/shell.lnm"
 
 This is the first LNM file the engine parses. All other `.lnm` files are reached through `switch.replace`, `switch.overlay`, or `switch.tooltip` from here.
 
+For the `lucyn` executable, runtime configuration is supplied as JSON with `--config`. The current executable reads `lnm.entry`, `search.default`, and `search.searxng_url`; other fields in the C++ embedding API remain independent of this file format.
+
+```json
+{
+  "lnm": {
+    "entry": "./ui/shell.lnm"
+  },
+  "search": {
+    "default": "brave",
+    "searxng_url": "https://your-searxng-instance.example"
+  }
+}
+```
+
+The entry path is relative to the config file. Paths in `grab(...)` and `switch.*` are relative to the entry file's directory. When an entry is configured, `lucyn` loads it at startup and presents its current view through the existing layout, software painter, and SDL window. The window is created hidden by default; pass `--show` to display it immediately, or use the JSON `window` command. While an LNM app is current, SDL mouse and text events can focus and edit `<input>` fields. An LNM `<input type="search">` submits through the configured search provider when Enter is pressed. Config files without `lnm.entry` start the normal engine without an LNM app.
+
 ---
 
 ### Window
@@ -92,7 +108,7 @@ engine.config.max_tabs               = 20
 
 ```cpp
 engine.config.search.default     = "brave"
-engine.config.search.searxng_url = "https://searx.example.com"
+engine.config.search.searxng_url = "https://searx.example.com"  // optional instance
 ```
 
 | Field | Type | Description |
@@ -100,11 +116,11 @@ engine.config.search.searxng_url = "https://searx.example.com"
 | `default` | string | Default search engine |
 | `searxng_url` | string | Custom SearXNG instance URL (only used when default = "searxng") |
 
-**Supported values for `default`:**
-- `"google"`
-- `"brave"`
-- `"duckduckgo"`
-- `"searxng"`
+The built-in providers are `brave`, `searxng`, `google`, `duckduckgo`, `bing`, `ecosia`, `startpage`, `mojeek`, `qwant`, and `swisscows`. This is a set of free-to-use web search pages, not a quality ranking. SearXNG is software with independently hosted instances, so configure `searxng_url` before selecting it.
+
+Providers live in `lucyn::search::Registry`; adding or replacing one takes an id, display name, and URL template containing one `{query}` placeholder. The query is percent-encoded, so providers can be added without creating a new controller path.
+
+The Node client can open a page with `await browser.open(url)` or search and load the results page with `await browser.search(query, { engine: "brave" })`. Omitting `engine` uses this config's `search.default`. These calls use normal LucyN navigation; they do not call a paid search API or scrape result data.
 
 ---
 

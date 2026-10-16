@@ -6,21 +6,36 @@
 // Mode: a hidden window is still a real SDL window — real display, real
 // size, real surface — it just never calls SDL_ShowWindow. Headless checks
 // that look for a real window all pass, because the window *is* real.
+//
+// THREAD MODEL (Session 16). Every SDL call happens on one private UI thread
+// owned by the Window. The caller's thread (the controller) never touches SDL:
+//   * present() only stores the frame; the UI thread blits it, and re-blits the
+//     SAME frame on every expose / restore / focus / resize event. That is why
+//     the window no longer turns black (or shows the terminal behind it) while
+//     the engine is blocked in a slow network command.
+//   * pollEvents() drains a queue the UI thread fills, so it is cheap, never
+//     blocks, and may be called from any one thread.
+//   * create()/setVisible()/setTitle() hand work to the UI thread and wait.
+// Not supported on macOS, where Cocoa insists on the process main thread.
 #pragma once
 #include <lucyn/paint/framebuffer.h>
 
+#include <atomic>
 #include <string>
 #include <vector>
 
 namespace lucyn::ui {
 
-enum class EventType { Quit, Resize, MouseWheel, MouseClick };
+enum class EventType { Quit, Resize, MouseWheel, MouseClick, TextInput, KeyDown };
 
 struct Event {
     EventType type = EventType::Quit;
     int   width = 0, height = 0;     // Resize
     float scrollDX = 0, scrollDY = 0;  // MouseWheel
     int   clickX = 0, clickY = 0;    // MouseClick
+    int   key = 0;                   // KeyDown: SDL_Keycode value
+    bool  ctrl = false;              // KeyDown: Ctrl modifier
+    std::string text;                // TextInput: UTF-8 text
 };
 
 // Always true. Present only to make the design rule above checkable in code
@@ -47,23 +62,24 @@ public:
     // into it, so a later setVisible(true) shows real content immediately,
     // not a blank window.
     void setVisible(bool visible);
-    bool visible() const { return visible_; }
+    bool visible() const { return visible_.load(); }
 
     void setTitle(const std::string& title);
     int  width() const { return w_; }
     int  height() const { return h_; }
 
-    // Copies `fb` onto the window's surface and (only if visible) presents
-    // it on screen. Safe, and expected, to call while hidden.
+    // Stores `fb` as the current frame. The UI thread copies it onto the
+    // window's surface (and, only if visible, onto the screen) within a few
+    // milliseconds, and keeps re-drawing it whenever the OS asks. Safe, and
+    // expected, to call while hidden. Returns immediately.
     void present(const lucyn::paint::Framebuffer& fb);
 
-    // Pumps SDL's event queue and returns what happened since the last call.
-    // Must run on the main thread (see SESSION11.md's "event loop vs stdin
-    // loop" note: the controller pumps this between stdin commands, not on a
-    // separate thread — controller.h's "no threads" sentence is kept as-is;
-    // the trade-off is that window events are only noticed when the next
-    // command line arrives, not instantly). A Window that was never
-    // created(), or failed to, returns an empty vector.
+    // Returns the input events that happened since the last call (the UI
+    // thread collects them even while the controller is busy running a
+    // command, so nothing typed during a slow page load is lost). Repainting
+    // for expose/restore/focus is handled by the UI thread itself and is not
+    // reported here; Resize still is, so the owner can re-layout.
+    // A Window that was never created(), or failed to, returns an empty vector.
     std::vector<Event> pollEvents();
 
     const std::string& lastError() const { return lastError_; }
@@ -71,9 +87,8 @@ public:
 private:
     struct Impl;
     Impl* impl_ = nullptr;
-    int w_ = 0, h_ = 0;
-    bool visible_ = false;
-    bool sdlOwned_ = false;   // true once create() succeeded in acquiring an SDL video refcount
+    std::atomic<int> w_{0}, h_{0};
+    std::atomic<bool> visible_{false};
     std::string lastError_;
 };
 

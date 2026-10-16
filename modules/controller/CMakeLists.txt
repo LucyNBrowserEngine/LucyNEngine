@@ -32,6 +32,9 @@ endif()
 if(NOT TARGET lucyn::js)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../js      ${CMAKE_CURRENT_BINARY_DIR}/js)
 endif()
+if(NOT TARGET lucyn::search AND (NOT DEFINED LUCYN_MODULE_SEARCH OR LUCYN_MODULE_SEARCH))
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../search  ${CMAKE_CURRENT_BINARY_DIR}/search)
+endif()
 
 # ---- library ----------------------------------------------------------------
 add_library(lucyn_controller STATIC
@@ -55,6 +58,10 @@ target_link_libraries(lucyn_controller
         lucyn::server
         lucyn::adblock
 )
+if(TARGET lucyn::search)
+  target_link_libraries(lucyn_controller PRIVATE lucyn::search)
+  target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_SEARCH=1)
+endif()
 
 # ---- tests ------------------------------------------------------------------
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR LUCYN_BUILD_TESTS)

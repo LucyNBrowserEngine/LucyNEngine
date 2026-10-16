@@ -1,15 +1,14 @@
 # third_party/
 
-Third-party source we vendor (QuickJS, stb, Mongoose, and similar components)
-goes here as plain folders. Gumbo is a system dependency rather than vendored
-source. curl-impersonate is a separately supplied binary dependency.
-
-License summary and the distribution implications of Mongoose are in the repository root's
-`THIRD_PARTY_NOTICES.md`. Each vendored component's own license files remain authoritative.
+Everything LucyN carries with it. Source-vendored libraries (quickjs, gumbo, stb, mongoose, imgui)
+go here as plain folders. The one prebuilt binary dependency is below.
 
 ## curl-impersonate  (put it in `third_party/curl-impersonate/`)
 
-Gives LucyN real Chrome / Safari / Firefox TLS + HTTP/2 handshakes. CMake finds it by itself when it is here.
+Gives LucyN real Chrome / Safari / Firefox TLS + HTTP/2 handshakes. **This folder is the only place LucyN looks.** CMake does not
+search `/usr`, does not take a `-D` path and has no stock-libcurl fallback: if the files below are missing, `cmake` stops with an
+error that prints these steps. (A silent fallback to stock libcurl gave the engine curl's own TLS fingerprint, and sites answered
+it with bot challenges.) The build also bakes this folder into the binaries' rpath, so the loader uses this copy at run time.
 
 ```bash
 cd third_party && mkdir -p curl-impersonate && cd curl-impersonate

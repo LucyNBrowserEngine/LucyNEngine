@@ -27,12 +27,18 @@ const a = new Lucyn({
   console: false,             // echo page console.* to stderr
   adblock: true,               // built-in request filtering (default: true)
   adblockList: "./filters.txt", // optional additional EasyList/uBO rules
+  config: "./engine.json",     // optional engine config (search defaults and LNM entry)
+  show: true,                   // open the SDL window visibly at startup
   ghostful: false,            // create a real (hidden) SDL window at startup; see README.md's Ghostful Mode (Session 11)
 });
 
 // Navigate
 const { status, url, title } = await a.visit("https://example.com");
 console.log(status, title);   // 200 "Example Domain"
+
+// Direct navigation and free web search use the same visit pipeline.
+await a.open("https://example.org");
+await a.search("LucyN browser", { engine: "brave" });
 
 // Query the settled DOM
 const heading = await a.extract("h1");          // first match, text content
@@ -58,6 +64,8 @@ await a.close();
 | Command | Args | Returns |
 |---|---|---|
 | `visit(url, [opts])` | `url`, optional `opts.profile` | `{status, url, title}` |
+| `open(url, [opts])` | same as `visit` | direct website navigation |
+| `search(query, [opts])` | optional `opts.engine` (defaults to `search.default`) | loads provider results page; built-ins: Brave, SearXNG, Google, DuckDuckGo, Bing, Ecosia, Startpage, Mojeek, Qwant, Swisscows |
 | `html()` | none | settled HTML string |
 | `extract(selector)` | CSS selector | text content of first match |
 | `extractAll(selector)` | CSS selector | `string[]` of text contents |

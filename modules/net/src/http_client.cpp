@@ -170,7 +170,7 @@ static CURL* makeHandle(const std::string& target, std::string* err) {
     }
 #else
     if (!target.empty()) {
-        if (err) *err = "built against stock libcurl, which cannot impersonate (set LUCYN_CURL_IMPERSONATE_ROOT)";
+        if (err) *err = "built against stock libcurl, which cannot impersonate (put libcurl-impersonate in third_party/curl-impersonate/ and re-run cmake)";
         curl_easy_cleanup(h);
         return nullptr;
     }

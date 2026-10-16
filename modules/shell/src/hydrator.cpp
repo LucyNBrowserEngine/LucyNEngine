@@ -2,6 +2,7 @@
 #include <lucyn/shell/assets.h>
 #include <lucyn/shell/snapshot.h>
 #include <lucyn/shell/url.h>
+#include <cstring>
 #include <exception>
 #include <unordered_set>
 
@@ -21,6 +22,80 @@ std::string joinArgs(const std::vector<std::string>& args) {
     std::string s;
     for (size_t i = 0; i < args.size(); ++i) { if (i) s += ' '; s += args[i]; }
     return s;
+}
+
+// With scripting enabled a browser reads <noscript> content as raw text and never renders it. gumbo has no scripting flag, so it
+// parses that content as live markup instead (and a <noscript> in <head> that holds text even spills it into <body>). That is how
+// "JavaScript is required to ..." ended up painted on pages whose scripts DID run. This removes the content of every <noscript>
+// before parsing, keeping an empty <noscript></noscript>. Comments and script/style/textarea/title bodies are skipped over, so
+// a "<noscript>" inside a JS string is never touched. A <noscript> with no closing tag is left alone.
+std::string stripNoscript(const std::string& html, bool* changed) {
+    auto lc = [](char c) { return (c >= 'A' && c <= 'Z') ? char(c + 32) : c; };
+    auto at = [&](size_t pos, const char* lit) {
+        const size_t n = std::strlen(lit);
+        if (pos + n > html.size()) return false;
+        for (size_t i = 0; i < n; ++i) if (lc(html[pos + i]) != lit[i]) return false;
+        return true;
+    };
+    auto find = [&](size_t from, const char* lit) -> size_t {
+        const size_t n = std::strlen(lit);
+        for (size_t i = from; i + n <= html.size(); ++i) if (at(i, lit)) return i;
+        return std::string::npos;
+    };
+    auto tagEnds = [&](size_t pos, size_t nameLen) {          // the char after "<name" must end the name
+        const size_t k = pos + nameLen;
+        if (k >= html.size()) return true;
+        const char c = html[k];
+        return c == '>' || c == '/' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+    };
+    static const char* const kRaw[] = {"script", "style", "textarea", "title"};
+
+    std::string out;
+    out.reserve(html.size());
+    size_t i = 0;
+    while (i < html.size()) {
+        const size_t lt = html.find('<', i);
+        if (lt == std::string::npos) { out.append(html, i, std::string::npos); break; }
+        out.append(html, i, lt - i);
+        i = lt;
+        if (at(i, "<!--")) {
+            size_t e = html.find("-->", i + 4);
+            e = e == std::string::npos ? html.size() : e + 3;
+            out.append(html, i, e - i);
+            i = e;
+            continue;
+        }
+        bool handled = false;
+        for (const char* raw : kRaw) {
+            const size_t nl = std::strlen(raw);
+            if (at(i + 1, raw) && tagEnds(i + 1, nl)) {
+                const std::string closer = std::string("</") + raw;
+                size_t c = find(i + 1 + nl, closer.c_str());
+                size_t e = html.size();
+                if (c != std::string::npos) { size_t gt = html.find('>', c); e = gt == std::string::npos ? html.size() : gt + 1; }
+                out.append(html, i, e - i);
+                i = e;
+                handled = true;
+                break;
+            }
+        }
+        if (handled) continue;
+        if (at(i + 1, "noscript") && tagEnds(i + 1, 8)) {
+            const size_t c = find(i + 9, "</noscript");
+            if (c != std::string::npos) {
+                const size_t gt = html.find('>', c);
+                if (gt != std::string::npos) {
+                    out += "<noscript></noscript>";
+                    i = gt + 1;
+                    if (changed) *changed = true;
+                    continue;
+                }
+            }
+        }
+        out += '<';
+        ++i;
+    }
+    return out;
 }
 
 const char* kStandardHooks[] = {"page.url", "log", "snapshot.take", "snapshot.get", "snapshot.labels", "snapshot.diff"};
@@ -79,7 +154,11 @@ HydrateResult Hydrator::hydrate(const std::string& url) {
         if (fr.status >= 400) res.warnings.push_back("HTTP " + std::to_string(fr.status));
         if (fr.body.empty()) res.warnings.push_back("empty response body");
 
-        std::unique_ptr<dom::Document> site = dom::parseHtml(fr.body);
+        // A page that is about to get a JS engine is parsed the way a scripting browser parses it (no <noscript> content).
+        bool noscriptStripped = false;
+        std::unique_ptr<dom::Document> site = host_.available()
+            ? dom::parseHtml(stripNoscript(fr.body, &noscriptStripped))
+            : dom::parseHtml(fr.body);
         res.beforeHtml = fr.body;
 
         Snapshots snaps(options.saveSnapshots, res.url);
@@ -148,6 +227,8 @@ HydrateResult Hydrator::hydrate(const std::string& url) {
             if (!attached) res.warnings.push_back("JS host could not attach: " + attachErr);
         }
         res.jsAvailable = attached;
+        // The engine was there on paper but could not attach: the page has no scripting, so its <noscript> content is live.
+        if (!attached && noscriptStripped) site = dom::parseHtml(fr.body);
 
         auto runScripts = [&](RunAt at) {
             for (auto& s : scripts_.forUrl(res.url, at)) {

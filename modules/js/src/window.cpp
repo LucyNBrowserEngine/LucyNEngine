@@ -114,6 +114,20 @@ JSValue n_setDomException(ARGS) { if (argc) keep(c, S(c)->domExc, argv[0]); retu
 JSValue n_setObserving(ARGS) { State* s = S(c); s->observing = argc && JS_ToBool(c, argv[0]) > 0; if (!s->observing) s->records.clear(); return JS_UNDEFINED; }
 JSValue n_resolveUrl(ARGS) { std::string b, r; if (argc < 2 || !toStr(c, argv[0], b) || !toStr(c, argv[1], r)) return JS_EXCEPTION;
     return jstr(c, shell::resolveUrl(b, r)); }
+// n.navigate(absUrl, method, body, contentType): the page wants to go somewhere. Recorded, never followed here.
+JSValue n_navigate(ARGS) {
+    State* s = S(c);
+    std::string url, method = "GET", body, ctype;
+    if (argc < 1 || !toStr(c, argv[0], url)) return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !toStr(c, argv[1], method)) return JS_EXCEPTION;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !toStr(c, argv[2], body)) return JS_EXCEPTION;
+    if (argc > 3 && !JS_IsUndefined(argv[3]) && !toStr(c, argv[3], ctype)) return JS_EXCEPTION;
+    method = upperAscii(method);
+    if (method != "POST") { method = "GET"; body.clear(); ctype.clear(); }
+    s->nav = Navigation{url, method, body, ctype};
+    s->navPending = true;
+    return JS_UNDEFINED;
+}
 JSValue n_now(ARGS) { return JS_NewFloat64(c, S(c)->nowMs()); }
 JSValue n_randomValues(ARGS) {
     if (argc < 1 || JS_GetTypedArrayType(argv[0]) < 0)
@@ -242,6 +256,7 @@ bool installWindow(State& s) {
     fn(c, n, "now", n_now, 0);                          fn(c, n, "reportError", n_reportError, 1);
     fn(c, n, "randomValues", n_randomValues, 1);
     fn(c, n, "note", n_note, 1);                        fn(c, n, "getDocument", n_getDocument, 0);
+    fn(c, n, "navigate", n_navigate, 4);
     JSValue protos = JS_NewObject(c);
     JS_SetPropertyStr(c, protos, "Node", JS_DupValue(c, s.protoNode));
     JS_SetPropertyStr(c, protos, "Element", JS_DupValue(c, s.protoElement));

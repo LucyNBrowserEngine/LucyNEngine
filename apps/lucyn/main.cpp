@@ -25,6 +25,8 @@
 #include <lucyn/controller/controller.h>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 
@@ -67,6 +69,71 @@ static std::string jsonField(const std::string& line, const std::string& key) {
         } else out += line[p];
     }
     return out;
+}
+
+static bool jsonStringAt(const std::string& json, size_t& pos, std::string& out) {
+    if (pos >= json.size() || json[pos] != '"') return false;
+    out.clear();
+    for (++pos; pos < json.size(); ++pos) {
+        char c = json[pos];
+        if (c == '"') { ++pos; return true; }
+        if (c != '\\') { out += c; continue; }
+        if (++pos >= json.size()) return false;
+        switch (json[pos]) {
+            case '"': out += '"'; break;
+            case '\\': out += '\\'; break;
+            case '/': out += '/'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+// The runtime config is JSON, while the API spec remains the C++ embedding surface.
+// This executable only needs to read the one startup setting it owns today.
+static bool configString(const std::string& json, const std::string& objectName,
+                         const std::string& keyName, std::string& value, std::string& error) {
+    const size_t keyObject = json.find("\"" + objectName + "\"");
+    if (keyObject == std::string::npos) return true;
+    const size_t object = json.find('{', keyObject + objectName.size() + 2);
+    if (object == std::string::npos) { error = "config field '" + objectName + "' must be an object"; return false; }
+    const size_t end = json.find('}', object + 1);
+    const size_t key = json.find("\"" + keyName + "\"", object + 1);
+    if (key == std::string::npos || (end != std::string::npos && key > end)) return true;
+    const size_t colon = json.find(':', key + keyName.size() + 2);
+    if (colon == std::string::npos) { error = "config field '" + objectName + "." + keyName + "' is missing ':'"; return false; }
+    size_t pos = json.find_first_not_of(" \t\r\n", colon + 1);
+    if (pos == std::string::npos || !jsonStringAt(json, pos, value)) {
+        error = "config field '" + objectName + "." + keyName + "' must be a string";
+        return false;
+    }
+    return true;
+}
+
+static bool loadConfig(const std::string& path, lucyn::controller::ControllerOptions& opts, std::string& error) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { error = "cannot read config file: " + path; return false; }
+    std::ostringstream bytes;
+    bytes << file.rdbuf();
+    const std::string json = bytes.str();
+    std::string entry;
+    if (!configString(json, "lnm", "entry", entry, error)) return false;
+    if (!entry.empty()) {
+        namespace fs = std::filesystem;
+        fs::path entryPath = fs::u8path(entry);
+        if (entryPath.is_relative()) entryPath = fs::absolute(fs::u8path(path)).parent_path() / entryPath;
+        opts.lnmEntry = entryPath.lexically_normal().u8string();
+    }
+
+    if (!configString(json, "search", "default", opts.searchDefault, error) ||
+        !configString(json, "search", "searxng_url", opts.searxngUrl, error)) return false;
+    if (opts.searchDefault.empty()) opts.searchDefault = "brave";
+    return true;
 }
 
 static int runDownload(lucyn::controller::ControllerOptions opts, const std::string& url, const std::string& name,
@@ -124,6 +191,7 @@ static void usage(const char* argv0) {
         "  --events           write a request event per capture to stdout (the nothing-browser client uses this)\n"
         "  --show             show the window at startup, 1024x768 (default: not created until needed; needs an SDL2 build)\n"
         "  --ghostful         create the window at startup, hidden (needs an SDL2 build)\n"
+        "  --config <file>    read engine config JSON (currently lnm.entry)\n"
         "  --download <url>   one-shot: save <url> into nothing-data/downloads/, print the saved path, exit\n"
         "                     (0 = saved, 1 = failed). Extras: --name <file>  --overwrite  --max-bytes <n>  --referer <url>\n"
         "  --version          print version and exit\n"
@@ -140,6 +208,7 @@ int main(int argc, char** argv) {
     opts.initialProfile  = "chrome";
     opts.settleTimeoutMs = 5000;
     std::string dlUrl, dlName, dlReferer;
+    std::string configPath;
     bool dlOverwrite = false;
     long long dlMax = 0;
 
@@ -182,6 +251,8 @@ int main(int argc, char** argv) {
             opts.showWindow = true;
         } else if (a == "--ghostful") {
             opts.ghostfulWindow = true;
+        } else if (a == "--config" && i + 1 < argc) {
+            configPath = argv[++i];
         } else if (a == "--download" && i + 1 < argc) {
             dlUrl = argv[++i];
         } else if (a == "--name" && i + 1 < argc) {
@@ -205,6 +276,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (!configPath.empty()) {
+        std::string error;
+        if (!loadConfig(configPath, opts, error)) {
+            std::fprintf(stderr, "lucyn: %s\n", error.c_str());
+            return 1;
+        }
+    }
+
     // Tell the human where the listeners ended up, on STDERR (stdout is the JSON protocol channel).
     auto prev = opts.onEvent;
     opts.onEvent = [prev](const std::string& line) {
@@ -212,6 +291,14 @@ int main(int argc, char** argv) {
         if (line.rfind("{\"event\":\"moonbug\"", 0) == 0)
             std::fprintf(stderr, "[lucyn] moonbug up: %s\n", line.c_str());
     };
-    lucyn::controller::Controller ctrl(opts);
-    return ctrl.run();
+    int rc = 0;
+    {
+        lucyn::controller::Controller ctrl(opts);
+        rc = ctrl.run();
+    }
+    // A stdin reader thread may still be blocked in getline() (window closed before any more input). Leave without
+    // waiting for it, so closing the window really ends the process.
+    std::fflush(stdout);   // not fflush(nullptr): that would wait on stdin, which the reader thread still holds
+    std::fflush(stderr);
+    std::_Exit(rc);
 }

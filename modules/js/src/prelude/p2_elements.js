@@ -197,7 +197,7 @@ const H = HTMLElement.prototype;
 reflect(H, [['title', 's'], ['lang', 's'], ['dir', 's'], ['hidden', 'b'], ['tabIndex', 'i', 'tabindex']]);
 accessor(H, 'innerText', function () { return this.textContent; }, function (v) { this.textContent = String(v); });
 accessor(H, 'outerText', function () { return this.textContent; }, function (v) { this.textContent = String(v); });
-method(H, 'click', function click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true })); });
+method(H, 'click', function click() { if (this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true })) !== false) activate(this); });
 method(H, 'focus', function focus() {});
 method(H, 'blur', function blur() {});
 // No layout engine yet: geometry is honestly zero.

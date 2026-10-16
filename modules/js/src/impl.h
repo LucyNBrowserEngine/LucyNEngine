@@ -58,6 +58,10 @@ struct State {
     bool                                 scriptJobQueued = false;
     const dom::Node*                     currentScript = nullptr;
 
+    // Navigation requested by the page (see Navigation in quickjs_host.h). The newest request replaces the older one.
+    bool                 navPending = false;
+    Navigation           nav;
+
     // MutationObserver
     bool                 observing = false;
     std::vector<MutRec>  records;
@@ -91,9 +95,14 @@ struct State {
     void        runPendingScripts();
     bool        runScriptNode(dom::Node* script, std::string* err = nullptr);   // false = it threw (also recorded)
     bool        evalGlobal(const std::string& code, const std::string& file, std::string* err);
+    bool        evalModule(const std::string& code, const std::string& file, std::string* err);  // ES module eval (top-level await supported)
     bool        buildLucyn();
     void        releaseAll();
 };
+
+// Module loader/normalizer callbacks (registered from attach()).
+JSModuleDef* moduleLoaderCb(JSContext* c, const char* module_name, void* opaque);
+char*        moduleNormalizeCb(JSContext* c, const char* base, const char* name, void* opaque);
 
 // RAII time limit. Nested budgets can only shorten the deadline.
 struct Budget {
@@ -124,7 +133,9 @@ std::string upperAscii(std::string s);
 // ---- fetch_bridge.cpp ----
 bool installFetch(State& s, JSValueConst n_obj);      // adds the n.http*/n.utf8*/n.cookie* natives that fetch + XHR + document.cookie use; call from installWindow
 void pumpFetch(State& s);                              // deliver finished requests to their JS callbacks; call from drainJobs
-bool fetchAndRunScript(State& s, const std::string& absUrl, std::string* err); // download+eval a <script src>
+bool fetchScriptSource(State& s, const std::string& absUrl, std::string& body, std::string* err); // HTTP/file:// fetch of script source
+bool fetchAndRunScript(State& s, const std::string& absUrl, std::string* err); // download+eval a classic <script src>
+bool fetchAndRunModuleScript(State& s, const std::string& absUrl, std::string* err); // download+eval an ES module <script type=module src>
 void teardownFetch(JSContext* ctx);                    // free pending promises; call from releaseAll
 
 // ---- storage_bridge.cpp ----

@@ -67,17 +67,24 @@ n.setMutationSink(function (raw) {
 // ---- location / history ----------------------------------------------------------------------------------------------------------
 const setCur = (u) => { const p = parseUrl(u); curHref = p ? p.href : String(u); };
 setCur(curHref);                                                       // normalised from the start: location.href === document.URL
-const navIgnored = (u) => n.note('navigation to ' + n.resolveUrl(curHref, String(u)) + ' ignored (a hydrated page cannot navigate)');
+const navIgnored = (what) => n.note(what + ' ignored (not supported)');
+// The page asked to go somewhere. The host records the request (newest wins) and whoever drives it loads the new page once
+// this one has settled, with the same cookie jar: that is how a JS challenge ("solve, set a cookie, reload") completes.
+const navigate = (abs, method, body, ctype) => {
+  if (!/^https?:\/\//i.test(abs)) { n.note('navigation to ' + abs + ' ignored (only http and https can be followed)'); return; }
+  n.navigate(abs, method || 'GET', body === undefined ? '' : String(body), ctype || '');
+};
+const stripHash = (x) => String(x).replace(/#.*$/, '');
 const setHref = (u) => {
   const abs = n.resolveUrl(curHref, String(u));
-  const strip = (x) => x.replace(/#.*$/, '');
-  if (strip(abs) === strip(curHref)) setCur(abs); else navIgnored(u);   // a hash-only change is not a navigation
+  if (abs.indexOf('#') >= 0 && stripHash(abs) === stripHash(curHref)) { setCur(abs); return; }   // a fragment-only change is not a navigation
+  navigate(abs);
 };
 class Location {
   toString() { return curHref; }
   assign(u) { setHref(u); }
   replace(u) { setHref(u); }
-  reload() { navIgnored(curHref); }
+  reload() { navigate(stripHash(curHref)); }
 }
 markClass(Location, 'Location');
 for (const k of ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin']) {
@@ -87,7 +94,9 @@ for (const k of ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'se
       const p = parseUrl(curHref); if (!p) return;
       v = String(v);
       if (k === 'hash') { p.hash = v === '' || v === '#' ? '' : (v[0] === '#' ? v : '#' + v); setCur(buildHref(p)); return; }
-      navIgnored(v);
+      if (k === 'search') { p.search = v === '' || v === '?' ? '' : (v[0] === '?' ? v : '?' + v); return navigate(buildHref(p)); }
+      if (k === 'pathname') { p.pathname = v[0] === '/' ? v : '/' + v; return navigate(buildHref(p)); }
+      navIgnored('location.' + k + ' = ' + v);
     });
 }
 const LOC = Object.create(Location.prototype);
@@ -103,6 +112,62 @@ class History {
 }
 markClass(History, 'History');
 const HIST = Object.create(History.prototype);
+
+// ---- navigation started by elements: form.submit(), requestSubmit(), and the default action of el.click() ---------------------------
+// A GET form puts its fields in the action's query string; a POST form sends them urlencoded (multipart/file uploads are not
+// built here: such a form is sent urlencoded and says so).
+const formEntries = (form, submitter) => {
+  const fd = new FormData(form);
+  const out = [];
+  fd.forEach((v, k) => { out.push([k, typeof v === 'string' ? v : (v && v.name ? v.name : '')]); });
+  if (submitter && submitter.getAttribute) {
+    const nm = submitter.getAttribute('name');
+    if (nm && !submitter.hasAttribute('disabled')) out.push([nm, submitter.hasAttribute('value') ? submitter.getAttribute('value') : '']);
+  }
+  return out;
+};
+const encodeEntries = (entries) => entries.map(([k, v]) => enc(k) + '=' + enc(v)).join('&');
+const submitForm = (form, submitter) => {
+  const attrOf = (el, a) => (el && el.getAttribute ? el.getAttribute(a) : null);
+  const httpMethod = String(attrOf(submitter, 'formmethod') || attrOf(form, 'method') || 'get').toLowerCase();
+  if (httpMethod !== 'get' && httpMethod !== 'post') return;                       // method="dialog" and the like: nothing to load
+  const rawAction = attrOf(submitter, 'formaction');
+  const act = rawAction !== null && rawAction !== '' ? rawAction : attrOf(form, 'action');
+  const abs = n.resolveUrl(curHref, act === null || act === '' ? curHref : act);
+  const enctype = String(attrOf(submitter, 'formenctype') || attrOf(form, 'enctype') || 'application/x-www-form-urlencoded').toLowerCase();
+  const query = encodeEntries(formEntries(form, submitter));
+  if (httpMethod === 'get') {
+    const base = abs.replace(/#.*$/, '').replace(/\?.*$/, '');
+    navigate(base + (query ? '?' + query : ''));
+    return;
+  }
+  if (enctype.indexOf('multipart') === 0) n.note('multipart form sent as application/x-www-form-urlencoded (file parts are not built for form navigation)');
+  navigate(abs.replace(/#.*$/, ''), 'POST', query, 'application/x-www-form-urlencoded');
+};
+const FORM = tagProtos.form;
+method(FORM, 'submit', function submit() { submitForm(this, null); });               // no submit event, like a browser
+method(FORM, 'requestSubmit', function requestSubmit(submitter) {
+  const ev = new Event('submit', { bubbles: true, cancelable: true });
+  if (this.dispatchEvent(ev) !== false) submitForm(this, submitter || null);
+});
+// What a browser does after a click nobody cancelled: follow a link, or submit the form a submit button belongs to.
+const activate = (el) => {
+  const a = el.closest ? el.closest('a[href]') : null;
+  if (a) {
+    if (a.hasAttribute('download')) return;
+    const href = a.getAttribute('href');
+    if (/^\s*javascript:/i.test(href)) return;
+    setHref(href);
+    return;
+  }
+  const b = el.closest ? el.closest('button, input') : null;
+  if (!b || b.hasAttribute('disabled')) return;
+  const tag = b.tagName.toLowerCase();
+  const type = String(b.getAttribute('type') || (tag === 'button' ? 'submit' : 'text')).toLowerCase();
+  if (type !== 'submit' && type !== 'image') return;
+  const form = b.closest('form');
+  if (form) form.requestSubmit(b);
+};
 
 // ---- navigator / screen (from the persona; blank, never invented, when there is none) ---------------------------------------------
 const PER = n.persona ? JSON.parse(n.persona) : null;

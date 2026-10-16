@@ -21,16 +21,11 @@ command and real on-screen rendering need this module.
 
 ## Decisions made this session (see SESSION11.md for the longer version)
 
-- **Event loop vs stdin loop.** `controller.h`'s "no threads" rule stays
-  exactly as written. The controller pumps `Window::pollEvents()` once per
-  stdin command, not on a timer and not on a second thread. Trade-off,
-  stated plainly: a window event (close button, resize) is only noticed
-  when the next JSON command line arrives, not the instant it happens. Good
-  enough for a scripted/automated client; a human idly staring at the
-  window between commands will see it lag. The documented fallback, if that
-  ever matters: a reader thread queuing stdin lines for the main thread to
-  pump SDL between (works everywhere, including Windows pipes, but is the
-  bigger change the plan flagged).
+- **Event loop vs stdin loop.** With a live window and real stdin, a short-lived
+  reader thread waits for the next JSON line while the controller's main thread
+  pumps SDL events. This keeps SDL calls on the main thread and lets LNM inputs
+  accept mouse focus and keyboard text while the CLI waits. Injected streams
+  remain synchronous. Resize events repaint the current view at the new size.
 - **Pixel format.** `Framebuffer`'s packed `uint32_t` (`(r<<24)|(g<<16)|(b<<8)|a`)
   is, in little-endian memory, byte order A,B,G,R — `SDL_PIXELFORMAT_ABGR32`,
   not `SDL_PIXELFORMAT_RGBA32` (that alias is endianness-normalised to
@@ -41,7 +36,5 @@ command and real on-screen rendering need this module.
   in CMakeLists.txt, so `ctest` alone is enough — no manual env var). They
   check creation, hide/show flags, resizing, `present()` not crashing, and
   `pollEvents()` not crashing. **What they cannot verify:** an actual window
-  appearing on a real desktop, real mouse/keyboard input landing correctly,
-  real click-and-drag resize. That needs a human: `./bin/lucyn --show` then
-  `{"cmd":"visit","url":"https://example.com"}` should show the page in a
-  real window.
+  appearing on a real desktop or real mouse/keyboard input landing correctly.
+  The LNM demo provides a search field to check that manually.

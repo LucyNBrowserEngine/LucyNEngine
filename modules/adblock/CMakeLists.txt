@@ -38,6 +38,24 @@ target_include_directories(nothing-adblock PUBLIC
 )
 target_compile_options(nothing-adblock PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra>)
 
+# ─── Default filter folder ──────────────────────────────────────
+# modules/adblock/filters/*.txt ships with the engine (default.txt today,
+# drop in more later, any name, same EasyList/uBO rule syntax). Copied next
+# to the built binaries as "adblock-filters/" so the running engine finds it
+# the same way lucyn::net finds third_party/curl-impersonate: no path flag
+# needed, "the engine setup and build look for it there" by default.
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+  set(_adblock_out_dir "${CMAKE_BINARY_DIR}/bin")
+else()
+  set(_adblock_out_dir "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
+add_custom_command(TARGET nothing-adblock POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_adblock_out_dir}/adblock-filters"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/filters" "${_adblock_out_dir}/adblock-filters"
+    COMMENT "lucyn::adblock: copying default filter list(s) to ${_adblock_out_dir}/adblock-filters"
+)
+
 # ─── Test binary ────────────────────────────────────────────────
 # Only built when testing, not when used as a dependency
 option(ADBLOCK_BUILD_TESTS "Build adblock tests" OFF)

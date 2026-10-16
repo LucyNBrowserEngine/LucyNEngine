@@ -141,6 +141,16 @@ bool State::evalGlobal(const std::string& code, const std::string& file, std::st
     return ok;
 }
 
+bool State::evalModule(const std::string& code, const std::string& file, std::string* err) {
+    Budget b(*this, opts.scriptTimeoutMs);
+    JSValue r = JS_Eval(ctx, code.c_str(), code.size(), file.c_str(), JS_EVAL_TYPE_MODULE);
+    bool ok = !JS_IsException(r);
+    if (!ok) { std::string e = takeException(); if (err) *err = e; }
+    JS_FreeValue(ctx, r);
+    drainJobs();
+    return ok;
+}
+
 bool State::runOneDueTimer(double t) {
     int best = -1;
     for (size_t i = 0; i < timers.size(); ++i) {
@@ -259,19 +269,21 @@ bool State::runScriptNode(dom::Node* n, std::string* err) {
     startedScripts.insert(n);
     createdScripts.erase(n);
     if (n->hasAttr("nomodule")) return true;
+    const std::string* type = n->attr("type");
+    bool isModule = type && lowerAscii(*type) == "module";
+    if (type && !isModule && !classicScriptType(type)) return true;  // JSON / importmap / templates are data, not code
     if (const std::string* src = n->attr("src")) {
         std::string absUrl = shell::resolveUrl(pageUrl, *src);
+        if (isModule) return fetchAndRunModuleScript(*this, absUrl, err);
         return fetchAndRunScript(*this, absUrl, err);
     }
-    const std::string* type = n->attr("type");
-    if (type && lowerAscii(*type) == "module") { addNote("<script type=module> skipped (not supported yet)"); return true; }
-    if (!classicScriptType(type)) return true;                // JSON / importmap / templates are data, not code
     std::string code;
     for (auto& c : n->children) if (c->isText()) code += c->text;
     if (code.find_first_not_of(" \t\r\n") == std::string::npos) return true;
     currentScript = n;
     std::string e;
-    bool ok = evalGlobal(code, pageUrl.empty() ? "inline" : pageUrl, &e);
+    bool ok = isModule ? evalModule(code, pageUrl.empty() ? "inline-module" : pageUrl, &e)
+                       : evalGlobal(code, pageUrl.empty() ? "inline" : pageUrl, &e);
     currentScript = nullptr;
     if (!ok) { addError(e); if (err) *err = e; }
     return ok;
@@ -398,6 +410,11 @@ bool QuickJsHost::attach(dom::Document& shell, const std::string& pageUrl, shell
     if (opts_.memoryLimitBytes) JS_SetMemoryLimit(s->rt, opts_.memoryLimitBytes);
     if (opts_.stackLimitBytes) JS_SetMaxStackSize(s->rt, opts_.stackLimitBytes);
     JS_SetInterruptHandler(s->rt, interruptCb, s.get());
+    // ES module support: register a URL-aware loader so <script type="module"> and
+    // dynamic import() can resolve relative specifiers against the page URL. The
+    // loader fetches modules over the same HTTP path as <script src>; opaque is
+    // unused (the State pointer comes from the context's opaque slot).
+    JS_SetModuleLoaderFunc(s->rt, moduleNormalizeCb, moduleLoaderCb, nullptr);
     s->ctx = JS_NewContext(s->rt);
     if (!s->ctx) return fail("cannot create the JS context");
     JS_SetContextOpaque(s->ctx, s.get());
@@ -454,6 +471,7 @@ shell::ScriptOutcome QuickJsHost::runPageScripts() {
     int failed = 0;
     std::string first;
     for (dom::Node* n : s.doc->getElementsByTagName("script")) {
+        if (s.navPending) break;                             // the page already asked to leave: the rest would be wasted work
         if (s.shellScripts.count(n) || s.startedScripts.count(n)) continue;
         std::string e;
         if (!s.runScriptNode(n, &e)) { if (!failed) first = e; ++failed; }
@@ -474,6 +492,7 @@ bool QuickJsHost::settle(int timeoutMs) {
     if (!s.loadFired) { s.loadFired = true; s.readyState = "complete"; s.fireLifecycle("complete"); }   // readystatechange + load
     for (;;) {
         s.drainJobs();
+        if (s.navPending) return true;                       // leaving the page: nothing left to wait for
         bool ranOne = s.runOneDueTimer(s.nowMs());
         // One-shot timers keep the page "busy"; intervals and animation frames run when due but never block idleness.
         // A one-shot due far past the deadline (a 60 s keep-alive) cannot fire in this window: the page counts as idle.
@@ -489,6 +508,12 @@ bool QuickJsHost::settle(int timeoutMs) {
         double wake = std::min(nextAny, endAt);
         if (wake > t) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(wake - t));
     }
+}
+
+std::optional<Navigation> QuickJsHost::takeNavigation() {
+    if (!p_ || !p_->navPending) return std::nullopt;
+    p_->navPending = false;
+    return p_->nav;
 }
 
 void QuickJsHost::detach() {

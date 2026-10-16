@@ -1,0 +1,12 @@
+! LucyN default filter list.
+! EasyList/uBO-style rules, one per line. Blank lines and "!" comments are ignored.
+! This file ships with the engine and is loaded automatically from
+! <exeDir>/adblock-filters/ at startup (see modules/adblock/README on defaults).
+! Drop more .txt files (any name, same rule syntax) in that folder to extend it —
+! every .txt file there is loaded, no config needed.
+||doubleclick.net^
+||googlesyndication.com^
+||google-analytics.com^
+||adservice.google.com^
+||facebook.com^$third-party,script
+||connect.facebook.net^$third-party,script
