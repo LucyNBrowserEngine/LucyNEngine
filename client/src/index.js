@@ -7,7 +7,7 @@
  * @example
  * import Lucyn from "nothing-browser";
  *
- * const a = new Lucyn({ profile: "chrome" });
+ * const a = new Lucyn();
  * await a.visit("https://example.com");
  * const title = await a.extract("title");
  * const html  = await a.html();
@@ -67,34 +67,24 @@ function serialise(cmd) {
 class LucynSession extends EventEmitter {
   /**
    * @param {object} [opts]
-   * @param {string} [opts.profile="chrome"]       browser identity
    * @param {number} [opts.settleTimeoutMs=5000]   JS settle timeout
    * @param {boolean} [opts.console=false]          echo page console to stderr
    * @param {boolean} [opts.adblock=true]           enable the built-in request blocker
    * @param {string} [opts.adblockList]              additional ABP/uBO-format rule file
    * @param {string} [opts.binary]                  path to the `lucyn` binary
-   * @param {string} [opts.config]                  engine JSON config (search defaults, LNM entry)
+   * @param {string} [opts.config]                  engine JSON config (search defaults)
    * @param {boolean|object} [opts.moonbug]         start Moonbug listeners with the engine:
    *        true = defaults (raw 2005, signed 2006, dashboard 6969), or { raw, signed, dashboard, dashboardFile }
    *        where each port is a number (0 = any free port). All bind 127.0.0.1 only.
-   * @param {boolean} [opts.ghostful=false]         Ghostful Mode: create a real SDL window at startup, hidden
-   *        (README: "window hidden, still real"). Without this the engine still renders pages exactly the
-   *        same way — layout/paint don't need a window at all — this only affects whether an SDL window
-   *        object exists from the first instant versus being created lazily on first use. Needs an SDL2
-   *        build of the engine; harmless (just ignored, headless as always) otherwise.
-   * @param {boolean} [opts.show=false]              create and show the SDL window at startup
    */
   constructor(opts = {}) {
     super();
     this._moonbugOpts     = opts.moonbug ?? null;
     this.moonbug          = new Moonbug(this);
-    this._profile         = opts.profile ?? "chrome";
     this._settleTimeoutMs = opts.settleTimeoutMs ?? 5000;
     this._console         = opts.console ?? false;
     this._adblock          = opts.adblock ?? true;
     this._adblockList      = opts.adblockList ?? "";
-    this._ghostful        = opts.ghostful ?? false;
-    this._show            = opts.show ?? false;
     this._config          = opts.config ?? "";
     this._binary          = findBinary(opts.binary);
     this._proc            = null;
@@ -112,14 +102,11 @@ class LucynSession extends EventEmitter {
     this._started = true;
 
     const args = [
-      "--profile", this._profile,
-      "--settle",  String(this._settleTimeoutMs),
+      "--settle", String(this._settleTimeoutMs),
     ];
     if (this._console) args.push("--console");
     if (!this._adblock) args.push("--no-adblock");
     if (this._adblockList) args.push("--adblock-list", this._adblockList);
-    if (this._ghostful) args.push("--ghostful");
-    if (this._show) args.push("--show");
     if (this._config) args.push("--config", this._config);
     // The client always asks for capture events: they cost nothing until a listener is attached (see Moonbug below)
     // and a late-attached onRequest() must not miss the very first request.
@@ -218,13 +205,10 @@ class LucynSession extends EventEmitter {
    * Navigate to a URL and wait for the page to settle.
    * @param {string} url
    * @param {object} [opts]
-   * @param {string} [opts.profile]  switch profile for this visit
    * @returns {Promise<{status:number, url:string, title:string}>}
    */
   async visit(url, opts = {}) {
-    const cmd = { cmd: "visit", url };
-    if (opts.profile) cmd.profile = opts.profile;
-    const r = await this._send(cmd);
+    const r = await this._send({ cmd: "visit", url });
     return { status: r.status, url: r.url, title: r.title };
   }
 
@@ -335,28 +319,44 @@ class LucynSession extends EventEmitter {
   }
 
   /**
-   * Switch the browser identity. Affects the next visit().
-   * @param {string} name  e.g. "safari184", "firefox147", "chrome"
-   * @returns {Promise<string>}  the resolved profile name
+   * Type a value into a form field: sets the element's `value` in the DOM, then dispatches
+   * bubbling `input` and `change` events (in that order, like a browser), so React/Vue-style
+   * listeners pick the change up.
+   * @param {string} selector  CSS selector
+   * @param {string} value
+   * @returns {Promise<string>}  the field element's tagName (lowercase)
    */
-  async profile(name) {
-    const r = await this._send({ cmd: "profile", name });
-    return r.value;
+  async fill(selector, value) {
+    const r = await this._send({ cmd: "fill", selector, value });
+    return r.tag;
   }
 
   /**
-   * Return current engine info: active profile, last URL, impersonation status.
-   * @returns {Promise<{profile:string, url:string, impersonating:boolean}>}
+   * Submit a form. Pass the form itself (`form.submit()`, which navigates without firing a
+   * submit event — browser semantics) or an input/button inside it (a real click, which runs
+   * the form's submit handler first and honours cancellation). Waits for the page to settle
+   * and follows the navigation, like visit().
+   * @param {string} selector  CSS selector for the form (or a submit input/button in it)
+   * @returns {Promise<string>}  the element's tagName (lowercase)
+   */
+  async submit(selector) {
+    const r = await this._send({ cmd: "submit", selector });
+    return r.tag;
+  }
+
+  /**
+   * Return current engine info: last URL visited and how many requests Moonbug has captured.
+   * @returns {Promise<{url:string, captures:number}>}
    */
   async info() {
     const r = await this._send({ cmd: "info" });
-    return { profile: r.profile, url: r.url, impersonating: r.impersonating };
+    return { url: r.url, captures: r.captures };
   }
 
   /**
    * Cookies in the engine's jar. With a url: exactly what a request to it would carry (HttpOnly cookies
    * included, flagged). Without: the whole jar. The jar is shared by page scripts (document.cookie, which
-   * cannot see HttpOnly) and every request the engine makes, and it starts empty after a profile switch.
+   * cannot see HttpOnly) and every request the engine makes.
    * @param {string} [url]
    * @returns {Promise<Array<{name:string, value:string, domain:string, path:string, hostOnly:boolean,
    *                          secure:boolean, httpOnly:boolean, expires:number}>>}  expires: unix seconds, 0 = session
@@ -399,9 +399,8 @@ class LucynSession extends EventEmitter {
   }
 
   /**
-   * Render the current page (through layout + the software painter, no SDL/display needed) into
-   * `nothing-data/screenshots/` and return its path. Works even on an engine built without SDL2 —
-   * this is pure offscreen rendering, not a capture of a real window.
+   * Render the current page (through layout + the software painter) into `nothing-data/screenshots/`
+   * and return its path. Pure offscreen rendering: the engine has no window at all.
    * @param {string} [name="screenshot.png"]
    * @param {object} [opts]
    * @param {number} [opts.width]   viewport width in px used for layout (default: 800)
@@ -413,29 +412,6 @@ class LucynSession extends EventEmitter {
     if (opts.width > 0) cmd.width = Math.floor(opts.width);
     const r = await this._send(cmd);
     return r.path;
-  }
-
-  /**
-   * Show, hide, or resize the engine's real SDL window (Ghostful Mode's `setVisible`, from JS).
-   * `ok:false` with a clear error if the engine was built without SDL2.
-   * @param {object} [opts]
-   * @param {boolean} [opts.visible]
-   * @param {number}  [opts.width]
-   * @param {number}  [opts.height]
-   * @returns {Promise<{visible:boolean, width:number, height:number}>}
-   */
-  async setWindow(opts = {}) {
-    const cmd = { cmd: "window" };
-    if (opts.visible !== undefined) cmd.visible = !!opts.visible;
-    if (opts.width > 0) cmd.width = Math.floor(opts.width);
-    if (opts.height > 0) cmd.height = Math.floor(opts.height);
-    const r = await this._send(cmd);
-    return { visible: r.visible, width: r.width, height: r.height };
-  }
-
-  /** Convenience: `setWindow({ visible })`. Matches the `engine.setVisible(false)` examples in README.md. */
-  async setVisible(visible) {
-    return this.setWindow({ visible: !!visible });
   }
 
   /** Empty the cookie jar. */
@@ -518,10 +494,9 @@ class Moonbug {
 
 /**
  * Create a new LucyN session. Each instance is an isolated browser context
- * (separate process, separate identity, separate cookies).
+ * (separate process, separate cookie jar).
  *
  * @param {object} [opts]
- * @param {string} [opts.profile="chrome"]
  * @param {number} [opts.settleTimeoutMs=5000]
  * @param {boolean} [opts.console=false]
  * @param {string} [opts.binary]

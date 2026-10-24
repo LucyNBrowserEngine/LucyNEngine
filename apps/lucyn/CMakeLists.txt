@@ -19,6 +19,6 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR LUCYN_BUILD_TESTS)
     add_executable(test_cli_download tests/test_cli_download.cpp)
     target_link_libraries(test_cli_download PRIVATE lucyn::controller)
     target_compile_options(test_cli_download PRIVATE -Wall -Wextra)
-    target_include_directories(test_cli_download PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../modules/net/tests)
+    # mini_server.h sits beside this test (moved out of modules/net/tests when libcurl left).
     add_test(NAME cli_download COMMAND test_cli_download $<TARGET_FILE:lucyn>)
 endif()

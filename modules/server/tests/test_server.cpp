@@ -7,7 +7,9 @@
 int main() { std::puts("SKIP: server tests use POSIX sockets"); return 0; }
 #else
 
-#include <lucyn/net/http_client.h>
+// Session 19: lucyn/net/http_client.h is gone (Chromium is the HTTP stack now). The
+// capture-server tests feed Moonbug the same way the controller's CEF bridge does:
+// moonbug.begin(...) / finish(...) directly, with the fields a real 200 carries.
 #include <lucyn/net/moonbug.h>
 #include <lucyn/security/nullbyte.h>
 #include <lucyn/server/capture_server.h>
@@ -337,10 +339,19 @@ static void test_capture_server() {
     CHECK(origin.listen(0));
     const std::string pageUrl = "http://127.0.0.1:" + std::to_string(origin.port()) + "/page";
 
-    profile::Switcher sw("");
-    net::HttpClient client(sw);
     net::Moonbug mb;
-    client.setMoonbug(&mb);
+    // One capture, exactly what the CEF bridge records for a real 200 of that page.
+    auto hit = [&mb](const std::string& url) {
+        net::Capture c = mb.begin("GET", url, /*profile=*/"", /*impersonating=*/false);
+        c.finalUrl        = url;
+        c.status          = 200;
+        c.httpVersion     = "1.1";
+        c.responseHeaders = {{"Content-Type", "text/html; charset=utf-8"}};
+        c.responseBody    = "<title>Origin</title><h1>caf\xc3\xa9</h1>";
+        c.responseBytes   = c.responseBody.size();
+        c.done            = true;
+        mb.finish(c);
+    };
     security::Nullbyte nb(std::string(32, 'K'));
     std::atomic<bool> go{true};
     std::thread bg;           // keeps fetching while the CaptureServer is destroyed
@@ -355,14 +366,14 @@ static void test_capture_server() {
         CHECK(!cs.activate(0, &err) && err.find("already") != std::string::npos);
 
         // an early capture BEFORE any client joins: must show up in history for late joiners
-        client.get(pageUrl);
+        hit(pageUrl);
         CHECK(mb.total() == 1);
 
         WsConn raw, signedC, dash;
         CHECK(raw.open(rawP, "/stream") && signedC.open(sigP, "/stream") && dash.open(dashP, "/stream"));
         std::this_thread::sleep_for(50ms);   // let the three clients register
 
-        client.get(pageUrl);                                                      // live capture #2
+        hit(pageUrl);                                                          // live capture #2
 
         std::string rawMsg = raw.readText(), sigMsg = signedC.readText(), dashMsg = dash.readText();
         CHECK(!rawMsg.empty() && !sigMsg.empty() && !dashMsg.empty());
@@ -430,20 +441,20 @@ static void test_capture_server() {
 
         // captures keep flowing with a client that never reads (slow consumer) and traffic from other threads
         std::vector<std::thread> ts;
-        for (int t = 0; t < 3; ++t) ts.emplace_back([&] { for (int i = 0; i < 10; ++i) client.get(pageUrl); });
+        for (int t = 0; t < 3; ++t) ts.emplace_back([&] { for (int i = 0; i < 10; ++i) hit(pageUrl); });
         for (auto& t : ts) t.join();
         CHECK(mb.total() == 32);
         for (int i = 0; i < 30; ++i) CHECK(!raw.readText().empty());              // 30 more live captures arrive (ids 3..32)
 
         // destroy the server while a fetch is in flight on another thread: must not crash (Moonbug fires listeners unlocked)
-        bg = std::thread([&] { while (go) client.get(pageUrl); });
+        bg = std::thread([&] { while (go) hit(pageUrl); });
         std::this_thread::sleep_for(30ms);
     }   // ~CaptureServer here, while bg keeps fetching
     std::this_thread::sleep_for(50ms);
     go = false;
     bg.join();
     uint64_t before = mb.total();
-    client.get(pageUrl);
+    hit(pageUrl);
     CHECK(mb.total() == before + 1);                                              // Moonbug itself still works after the server is gone
     std::puts("PASS: capture_server");
 }

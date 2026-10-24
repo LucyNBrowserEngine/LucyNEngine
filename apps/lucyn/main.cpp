@@ -2,7 +2,6 @@
 //
 // Usage:
 //   lucyn                          # JSON command loop on stdin/stdout
-//   lucyn --profile safari184      # start with a specific profile
 //   lucyn --settle 8000            # JS settle timeout in ms
 //   lucyn --console                # echo page console to stderr
 //   lucyn --no-adblock             # disable built-in request filtering
@@ -10,10 +9,8 @@
 //   lucyn --moonbug                # Moonbug on: raw :2005, NULLBYTE-signed :2006, dashboard :6969 (127.0.0.1 only)
 //   lucyn --dashboard 8080         # just the dashboard, on a port of your choice (also --raw N, --signed N; 0 = any free port)
 //   lucyn --events                 # also stream {"event":"request"...} capture lines on stdout
-//   lucyn --show                   # show the (always-real) window at startup, 1024x768 (Ghostful Mode default: hidden)
-//   lucyn --ghostful               # create the window at startup, hidden (vs. the engine's own default: not created until needed)
 //   lucyn --download <url>         # ONE-SHOT: save <url> into nothing-data/downloads/, print the saved path, exit 0 (1 on failure)
-//        [--name f] [--overwrite] [--max-bytes N] [--referer R]     (any --profile works too)
+//        [--name f] [--overwrite] [--max-bytes N] [--referer R]
 //   lucyn --version                # print version and exit
 //   lucyn --help
 //
@@ -22,10 +19,12 @@
 // command reference.
 //
 // This is what the nothing-browser JS client spawns as a child process.
+// CEF (Chromium Embedded Framework) — the engine from Session 19 on. Only used
+// here for the subprocess check; the controller does not talk to CEF yet.
+#include <lucyn/cef_host/browser_host.h>
 #include <lucyn/controller/controller.h>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -95,7 +94,7 @@ static bool jsonStringAt(const std::string& json, size_t& pos, std::string& out)
 }
 
 // The runtime config is JSON, while the API spec remains the C++ embedding surface.
-// This executable only needs to read the one startup setting it owns today.
+// This executable reads the startup settings it owns today: search.*.
 static bool configString(const std::string& json, const std::string& objectName,
                          const std::string& keyName, std::string& value, std::string& error) {
     const size_t keyObject = json.find("\"" + objectName + "\"");
@@ -121,14 +120,6 @@ static bool loadConfig(const std::string& path, lucyn::controller::ControllerOpt
     std::ostringstream bytes;
     bytes << file.rdbuf();
     const std::string json = bytes.str();
-    std::string entry;
-    if (!configString(json, "lnm", "entry", entry, error)) return false;
-    if (!entry.empty()) {
-        namespace fs = std::filesystem;
-        fs::path entryPath = fs::u8path(entry);
-        if (entryPath.is_relative()) entryPath = fs::absolute(fs::u8path(path)).parent_path() / entryPath;
-        opts.lnmEntry = entryPath.lexically_normal().u8string();
-    }
 
     if (!configString(json, "search", "default", opts.searchDefault, error) ||
         !configString(json, "search", "searxng_url", opts.searxngUrl, error)) return false;
@@ -177,7 +168,6 @@ static void usage(const char* argv0) {
         "usage: %s [options]\n"
         "\n"
         "options:\n"
-        "  --profile <name>   start with this browser profile (default: chrome)\n"
         "  --settle  <ms>     JS settle timeout in ms (default: 5000)\n"
         "  --console          echo page console.* to stderr\n"
         "  --no-adblock       disable request filtering (enabled by default)\n"
@@ -189,9 +179,7 @@ static void usage(const char* argv0) {
         "  --dashboard <port> capture dashboard (http://127.0.0.1:<port>/)\n"
         "  --dashboard-file <f>  serve this HTML instead of the built-in dashboard\n"
         "  --events           write a request event per capture to stdout (the nothing-browser client uses this)\n"
-        "  --show             show the window at startup, 1024x768 (default: not created until needed; needs an SDL2 build)\n"
-        "  --ghostful         create the window at startup, hidden (needs an SDL2 build)\n"
-        "  --config <file>    read engine config JSON (currently lnm.entry)\n"
+        "  --config <file>    read engine config JSON (search.default, search.searxng_url)\n"
         "  --download <url>   one-shot: save <url> into nothing-data/downloads/, print the saved path, exit\n"
         "                     (0 = saved, 1 = failed). Extras: --name <file>  --overwrite  --max-bytes <n>  --referer <url>\n"
         "  --version          print version and exit\n"
@@ -204,8 +192,17 @@ static void usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    // CEF is multi-process: Chromium re-executes this binary as a renderer/gpu/
+    // utility subprocess. If we ARE a subprocess, hand control straight to CEF
+    // and exit with its return code — this check must run before ANYTHING else
+    // (no logging, no file I/O, no option parsing) or subprocesses hang/crash.
+    // cef_host::executeCefProcess passes our LucynApp so renderer subprocesses get
+    // the eval/V8 hook (a raw CefExecuteProcess(nullptr) would leave eval broken).
+    // Only when it returns -1 are we the browser process.
+    const int cef_subprocess_exit = lucyn::cef_host::executeCefProcess(argc, argv);
+    if (cef_subprocess_exit >= 0) return cef_subprocess_exit;
+
     lucyn::controller::ControllerOptions opts;
-    opts.initialProfile  = "chrome";
     opts.settleTimeoutMs = 5000;
     std::string dlUrl, dlName, dlReferer;
     std::string configPath;
@@ -220,8 +217,6 @@ int main(int argc, char** argv) {
         } else if (a == "--version") {
             std::puts("lucyn 0.7.0-m7");
             return 0;
-        } else if (a == "--profile" && i + 1 < argc) {
-            opts.initialProfile = argv[++i];
         } else if (a == "--settle" && i + 1 < argc) {
             opts.settleTimeoutMs = std::atoi(argv[++i]);
             if (opts.settleTimeoutMs <= 0) opts.settleTimeoutMs = 5000;
@@ -247,10 +242,6 @@ int main(int argc, char** argv) {
             opts.dashboardFile = argv[++i];
         } else if (a == "--events") {
             opts.captureEvents = true;
-        } else if (a == "--show") {
-            opts.showWindow = true;
-        } else if (a == "--ghostful") {
-            opts.ghostfulWindow = true;
         } else if (a == "--config" && i + 1 < argc) {
             configPath = argv[++i];
         } else if (a == "--download" && i + 1 < argc) {
@@ -270,8 +261,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!dlUrl.empty()) return runDownload(opts, dlUrl, dlName, dlOverwrite, dlMax, dlReferer);
-    if (!dlName.empty() || dlOverwrite || dlMax > 0 || !dlReferer.empty()) {
+    // (the --download path runs further below, after initCef; this only catches the
+    // download-only flags when no --download <url> was given at all)
+    if (dlUrl.empty() && (!dlName.empty() || dlOverwrite || dlMax > 0 || !dlReferer.empty())) {
         std::fprintf(stderr, "--name/--overwrite/--max-bytes/--referer only make sense together with --download <url>\n");
         return 1;
     }
@@ -291,14 +283,33 @@ int main(int argc, char** argv) {
         if (line.rfind("{\"event\":\"moonbug\"", 0) == 0)
             std::fprintf(stderr, "[lucyn] moonbug up: %s\n", line.c_str());
     };
+    // Session 19: initialise Chromium BEFORE any command runs — the one-shot
+    // `--download` path fetches through Chromium's network stack now too (the
+    // subprocess check already ran at the top of main). On failure we keep going;
+    // engine commands then report "no browser instance (CEF not initialised)".
+    if (!lucyn::cef_host::initCef(argc, argv))
+        std::fprintf(stderr, "[lucyn] CEF init failed; engine commands will fail\n");
+
+    // One-shot --download: run that single command, then stop CEF and exit.
+    if (!dlUrl.empty()) {
+        const int dlRc = runDownload(opts, dlUrl, dlName, dlOverwrite, dlMax, dlReferer);
+        lucyn::cef_host::shutdownCef();
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(dlRc);
+    }
+
     int rc = 0;
     {
         lucyn::controller::Controller ctrl(opts);
         rc = ctrl.run();
     }
-    // A stdin reader thread may still be blocked in getline() (window closed before any more input). Leave without
-    // waiting for it, so closing the window really ends the process.
-    std::fflush(stdout);   // not fflush(nullptr): that would wait on stdin, which the reader thread still holds
+    // The Controller (and its BrowserInstance) is gone now; stop CEF's UI thread
+    // cleanly before the immediate _Exit below.
+    lucyn::cef_host::shutdownCef();
+    // Flush the protocol channel and leave immediately (skip static destructors; nothing
+    // is left to wait for — the engine has no window and no background threads to join).
+    std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(rc);
 }

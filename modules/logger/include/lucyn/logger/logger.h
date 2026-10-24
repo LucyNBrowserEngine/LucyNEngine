@@ -7,10 +7,10 @@
 
 namespace lucyn::logger {
 
-// The threshold follows severity order. SUCCESS is informational; BUILD and
-// LNM are informational categories. FATAL records a fatal condition but does
-// not terminate the process; the owning layer decides how to recover or exit.
-enum class Level { debug, info, success, warning, error, fatal, build, lnm };
+// The threshold follows severity order. SUCCESS and BUILD are informational
+// categories. FATAL records a fatal condition but does not terminate the
+// process; the owning layer decides how to recover or exit.
+enum class Level { debug, info, success, warning, error, fatal, build };
 enum class Threshold { debug, info, warning, error, fatal, off };
 
 // Defaults to DEBUG unless NDEBUG is defined, then WARN. Color is enabled only
@@ -31,7 +31,6 @@ public:
     void error(const std::string& message)   { log(Level::error, message); }
     void fatal(const std::string& message)   { log(Level::fatal, message); }
     void build(const std::string& message)   { log(Level::build, message); }
-    void lnm(const std::string& message)     { log(Level::lnm, message); }
 
     static constexpr Threshold defaultThreshold() {
 #ifdef NDEBUG

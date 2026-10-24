@@ -1,6 +1,6 @@
 {
   "name": "nothing-browser",
-  "version": "0.7.0",
+  "version": "3.0.0",
   "description": "JS client for the LucyN headless browser engine (M7)",
   "type": "module",
   "main": "./src/index.js",

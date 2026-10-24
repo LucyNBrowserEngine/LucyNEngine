@@ -5,12 +5,20 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   enable_testing()
 endif()
 
+option(LUCYN_BUILD_TESTS "Build module tests" ON)
+
 add_library(lucyn_search STATIC src/search.cpp)
 add_library(lucyn::search ALIAS lucyn_search)
 target_include_directories(lucyn_search PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lucyn_search PUBLIC cxx_std_17)
 if(NOT MSVC)
   target_compile_options(lucyn_search PRIVATE -Wall -Wextra)
+endif()
+
+if(LUCYN_BUILD_TESTS)
+  add_executable(test_search tests/test_search.cpp)
+  target_link_libraries(test_search PRIVATE lucyn::search)
+  add_test(NAME search COMMAND test_search)
 endif()
 
 option(LUCYN_BUILD_TOOLS "Build module command-line tools" ON)

@@ -4,48 +4,20 @@
 
 #include <lucyn/controller/controller.h>
 #include <lucyn/core/paths.h>
-#include <lucyn/profile/identity.h>
-#include <lucyn/profile/profile.h>
-#include <lucyn/shell/hydrator.h>
-#include <lucyn/shell/scripts.h>
-#include <lucyn/shell/url.h>
-#include <lucyn/js/quickjs_host.h>
-#include <lucyn/net/http_client.h>
 #include <lucyn/net/moonbug.h>
 #include <lucyn/security/nullbyte.h>
 #include <lucyn/server/capture_server.h>
 #ifdef LUCYN_CONTROLLER_HAVE_SEARCH
 #include <lucyn/search/search.h>
 #endif
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+#include <lucyn/cef_host/browser_host.h>
+#endif
 #include <blocker.h>
-#include <filesystem>
-
-// screenshot/window (SESSION11_PLAN.md Part D): independently optional, see
-// the root CMakeLists.txt comment where LUCYN_CONTROLLER_HAVE_PAINT/_UI get
-// defined. Neither define implies the other: a build can have paint+layout
-// (screenshot works, no SDL needed) without ui (window replies ok:false),
-// or — in principle, though no root option combination currently does this —
-// the reverse.
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
-#include <lucyn/layout/layout.h>
-#include <lucyn/layout/css.h>
-#include <lucyn/paint/software_painter.h>
-#ifdef LUCYN_HAVE_LITEHTML
-#include <lucyn/layout/litehtml_layout.h>
-#endif
-#endif
-#ifdef LUCYN_CONTROLLER_HAVE_LNM
-#include <lucyn/lnm/app.h>
-#endif
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-#include <lucyn/ui/window.h>
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +25,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -165,26 +138,12 @@ std::string replyValues(long long id, const std::vector<std::string>& values) {
 std::string replyErr(long long id, const std::string& err) {
     return "{\"id\":" + std::to_string(id) + ",\"ok\":false,\"error\":\"" + jsonEsc(err) + "\"}";
 }
+// fill/submit reply: {"id":N,"ok":true,"tag":"input"}
+std::string replyTag(long long id, const std::string& tag) {
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"tag\":\"" + jsonEsc(tag) + "\"}";
+}
 std::string eventLine(const std::string& type, const std::string& message) {
     return "{\"event\":\"" + jsonEsc(type) + "\",\"message\":\"" + jsonEsc(message) + "\"}";
-}
-
-// --- DOM helpers used by extract/extractAll ----------------------------------
-
-// Walk the DOM and collect text content of nodes matching `selector`.
-// We use the dom module's querySelector/querySelectorAll-style selectors
-// via Node::select() which is already part of the dom module.
-static std::vector<std::string> queryAll(const lucyn::dom::Document& doc, const std::string& sel) {
-    std::vector<std::string> results;
-    auto nodes = doc.querySelectorAll(sel);
-    for (auto* n : nodes) results.push_back(n->textContent());
-    return results;
-}
-
-static std::optional<std::string> queryOne(const lucyn::dom::Document& doc, const std::string& sel) {
-    auto* n = doc.querySelector(sel);
-    if (!n) return std::nullopt;
-    return n->textContent();
 }
 
 // --- download helpers ---------------------------------------------------------
@@ -337,172 +296,10 @@ fs::path uniqueDownloadPath(const std::string& dir, const std::string& name, boo
     return p;
 }
 
-std::string headerValue(const lucyn::net::Response& r, const std::string& lowerName) {
-    for (auto& kv : r.headers) if (lowerAscii(kv.first) == lowerName) return kv.second;
-    return {};
-}
-
-// scheme://host[:port] of an absolute URL ("" if it has none).
-std::string originOfUrl(const std::string& url) {
-    auto p = url.find("://");
-    if (p == std::string::npos) return {};
-    auto e = url.find_first_of("/?#", p + 3);
-    return url.substr(0, e == std::string::npos ? url.size() : e);
-}
-
-// What a browser puts in Referer for a navigation from `from` to `to` (strict-origin-when-cross-origin).
-std::string referrerFor(const std::string& from, const std::string& to) {
-    if (from.empty()) return {};
-    const std::string fo = originOfUrl(from);
-    if (fo.empty()) return {};
-    if (fo == originOfUrl(to)) return from.substr(0, from.find('#'));
-    return fo + "/";
-}
-
-std::string stripFragment(const std::string& u) { return u.substr(0, u.find('#')); }
-
-// <meta http-equiv="refresh" content="N; url=..."> -> a GET navigation. Only a refresh to a DIFFERENT page, due within 10 s, is
-// followed: a bare "refresh this page every 30 s" must not turn into a reload loop. (<noscript> content never gets here: the
-// Hydrator removes it for pages that run scripts.)
-std::optional<lucyn::js::Navigation> metaRefreshOf(const lucyn::dom::Document& doc, const std::string& pageUrl) {
-    for (const lucyn::dom::Node* m : doc.querySelectorAll("meta")) {
-        const std::string* he = m->attr("http-equiv");
-        const std::string* content = m->attr("content");
-        if (!he || !content || lowerAscii(*he) != "refresh") continue;
-        const std::string& c = *content;
-        size_t i = 0;
-        while (i < c.size() && std::isspace(static_cast<unsigned char>(c[i]))) ++i;
-        size_t d0 = i;
-        while (i < c.size() && (std::isdigit(static_cast<unsigned char>(c[i])) || c[i] == '.')) ++i;
-        if (i == d0) continue;
-        const double delay = std::atof(c.substr(d0, i - d0).c_str());
-        if (delay > 10.0) continue;
-        while (i < c.size() && (std::isspace(static_cast<unsigned char>(c[i])) || c[i] == ';' || c[i] == ',')) ++i;
-        if (lowerAscii(c.substr(i, 3)) == "url") {
-            i += 3;
-            while (i < c.size() && std::isspace(static_cast<unsigned char>(c[i]))) ++i;
-            if (i < c.size() && c[i] == '=') ++i;
-            while (i < c.size() && std::isspace(static_cast<unsigned char>(c[i]))) ++i;
-        }
-        std::string target = c.substr(i);
-        while (!target.empty() && std::isspace(static_cast<unsigned char>(target.back()))) target.pop_back();
-        if (target.size() >= 2 && (target.front() == '\'' || target.front() == '"') && target.back() == target.front())
-            target = target.substr(1, target.size() - 2);
-        if (target.empty()) continue;
-        std::string abs = lucyn::shell::resolveUrl(pageUrl, target);
-        if (abs.rfind("http://", 0) != 0 && abs.rfind("https://", 0) != 0) continue;
-        if (stripFragment(abs) == stripFragment(pageUrl)) continue;
-        lucyn::js::Navigation nav;
-        nav.url = abs;
-        return nav;
-    }
-    return std::nullopt;
-}
-
 } // anon namespace
 
 // ---- Controller::Impl -------------------------------------------------------
 
-
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
-// ---- blank-page guard -----------------------------------------------------------------------------------------------
-// A page can lay out to nothing (JS emptied the body, content sits in <noscript>/<template>, the server sent a
-// challenge page, ...). The window would then show pure white with no clue why. These helpers detect that and let
-// the controller fall back to something readable.
-namespace {
-
-static size_t countPaintedContent(const lucyn::layout::Box& b) {
-    size_t n = 0;
-    if (b.visible && (!b.text.empty() || (b.node && b.node->name == "input"))) ++n;
-    for (const auto& c : b.children) n += countPaintedContent(c);
-    return n;
-}
-
-static bool documentPaintsContent(const lucyn::dom::Document& doc, float width, float height) {
-    lucyn::layout::LayoutOptions o;
-    o.viewportWidth = width;
-    o.viewportHeight = height;
-    return countPaintedContent(lucyn::layout::layoutDocument(doc, o)) > 0;
-}
-
-static std::string htmlEsc(const std::string& s) {
-    std::string o;
-    o.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '&': o += "&amp;"; break;
-            case '<': o += "&lt;"; break;
-            case '>': o += "&gt;"; break;
-            default:  o += c;
-        }
-    }
-    return o;
-}
-
-static bool isBreakTag(const std::string& t) {
-    static const char* tags[] = {"div","p","li","ul","ol","br","tr","section","article","header","footer","main","nav",
-                                 "h1","h2","h3","h4","h5","h6","form","table","blockquote","pre","aside","hr","dt","dd"};
-    for (const char* x : tags) if (t == x) return true;
-    return false;
-}
-
-// Plain text of a subtree, one block per line. Unlike Node::textContent it KEEPS <noscript> text (that is often the
-// only human-readable thing on a JS challenge page) and appends link targets.
-static void collectLines(const lucyn::dom::Node& n, std::string& cur, std::vector<std::string>& lines) {
-    auto flush = [&] {
-        std::string t;
-        bool sp = false;
-        for (unsigned char c : cur) {
-            if (std::isspace(c)) { sp = !t.empty(); continue; }
-            if (sp) { t += ' '; sp = false; }
-            t += static_cast<char>(c);
-        }
-        if (!t.empty() && lines.size() < 400) lines.push_back(t.size() > 400 ? t.substr(0, 400) + "..." : t);
-        cur.clear();
-    };
-    if (n.isText()) { cur += n.text; return; }
-    if (n.isElement()) {
-        const std::string& t = n.name;
-        if (t == "script" || t == "style" || t == "head" || t == "template" || t == "svg") return;
-        const bool brk = isBreakTag(t);
-        if (brk) flush();
-        for (const auto& c : n.children) collectLines(*c, cur, lines);
-        if (t == "a") {
-            const std::string* href = n.attr("href");
-            if (href && href->rfind("http", 0) == 0 && cur.find(*href) == std::string::npos) cur += " (" + *href + ")";
-        }
-        if (brk) flush();
-        return;
-    }
-    for (const auto& c : n.children) collectLines(*c, cur, lines);
-    if (n.type == lucyn::dom::NodeType::Document) flush();
-}
-
-// A small readable page built from what the engine does know about a visit.
-static std::unique_ptr<lucyn::dom::Document> buildReadableFallback(const lucyn::dom::Document* source,
-                                                                   const std::string& url, long status,
-                                                                   const std::string& title, size_t htmlBytes,
-                                                                   const std::string& reason) {
-    std::vector<std::string> lines;
-    if (source) {
-        std::string cur;
-        collectLines(source->root(), cur, lines);
-    }
-    std::string h = "<!doctype html><html><head><title>" + htmlEsc(title) + "</title></head><body>";
-    h += "<h2>" + htmlEsc(title.empty() ? url : title) + "</h2>";
-    h += "<p>" + htmlEsc(url) + "</p>";
-    h += "<p>LucyN text view (" + htmlEsc(reason) + "). HTTP " + std::to_string(status) + ", " +
-         std::to_string(htmlBytes) + " bytes of HTML.</p><hr>";
-    if (lines.empty())
-        h += "<p>The page has no readable text. It is probably built entirely by scripts LucyN cannot run yet, "
-             "or the site refused this client (HTTP " + std::to_string(status) + ").</p>";
-    for (const auto& l : lines) h += "<p>" + htmlEsc(l) + "</p>";
-    h += "</body></html>";
-    return lucyn::dom::parseHtml(h);
-}
-
-}  // namespace
-#endif
 
 namespace lucyn::controller {
 
@@ -525,84 +322,62 @@ struct Controller::Impl {
     std::string       adblockNote;
     adblock::Blocker  adblocker;
     security::Nullbyte nullbyte;
-    net::Moonbug      moonbug;     // the wiretap; declared before `client` so it outlives it
+    net::Moonbug      moonbug;     // the wiretap
     std::atomic<bool> eventsOn{false};
     net::Moonbug::ListenerId  eventTap = 0;
-    profile::Switcher::Id     cookieListenerId_ = 0;
-    profile::Switcher sw;
-    net::HttpClient   client;
-    profile::IdentityStore idStore;
-    profile::IdentityManager idm;
-    shell::ScriptRegistry scripts;
 #ifdef LUCYN_CONTROLLER_HAVE_SEARCH
     lucyn::search::Registry searchEngines;
 #endif
 
-    // The hydrator is re-created per visit (stateless between visits).
-    // We keep the last hydrate result alive so html/extract/eval can use it.
-    // jsHost_ is kept alive across commands (keepAlive=true) so eval/waitFor/click work.
-    std::optional<shell::HydrateResult> lastResult;
-    std::unique_ptr<js::QuickJsHost>    jsHost_;
-    shell::NativeHooks                  liveHooks_;  // persistent hooks for the live context
     std::string lastUrl;
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
-    // What the painter should draw for the current visit. null = the live document. Set by chooseRenderDocument()
-    // when the live page would paint blank. The live document is never replaced (eval/extract keep using it).
-    std::unique_ptr<lucyn::dom::Document> renderOverride_;
-    std::string renderReason_;
-    // Stylesheet built from the live document's <style> blocks and any
-    // <link rel=stylesheet> CSS we managed to fetch. Rebuilt on each visit;
-    // reused by screenshot/window so both render paths see the same styles.
-    std::unique_ptr<lucyn::layout::Stylesheet> stylesheet_;
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+    // Session 19: Chromium-backed instance for the six migrated commands (visit,
+    // html, eval, extract, extractAll, click). Created only when the host process
+    // has already initialised CEF (apps/lucyn calls initCef). When absent — e.g.
+    // unit tests that never init CEF — those commands fall back to the old path.
+    std::unique_ptr<lucyn::cef_host::BrowserInstance> cef_;
+    // Moonbug feed (step 8): CEF in-flight resource captures keyed by CEF's request
+    // id, guarded by resMu_. onCefResource() runs on CEF's IO thread; a visit clears
+    // stale entries on this thread — both take resMu_, and it is declared BEFORE
+    // nothing that outlives it (destroyed after cef_ stops calling us).
+    std::mutex resMu_;
+    std::map<unsigned long long, net::Capture> pendingRes_;
 
-    // Build the stylesheet for the current page. Walks <style> blocks for their
-    // text, and <link rel="stylesheet" href="..."> for external CSS (fetched
-    // synchronously via the HTTP client — same path as <script src>). The
-    // sheet is stored in stylesheet_ and used by every render path.
-    void buildStylesheetFor(const lucyn::dom::Document& doc, const std::string& pageUrl) {
-        stylesheet_ = std::make_unique<lucyn::layout::Stylesheet>();
-        for (auto* node : doc.getElementsByTagName("style")) {
-            std::string text;
-            for (auto& c : node->children) if (c->isText()) text += c->text;
-            if (!text.empty()) stylesheet_->add(text);
+    // Bridge one CEF resource lifecycle event into Moonbug. Called DIRECTLY on
+    // CEF's IO thread from cef_host (not via pump) so captures are live even while
+    // the loop blocks in a wait (waitIdle needs that). Touches only moonbug (its
+    // own lock) and pendingRes_ (resMu_) → safe on that thread.
+    void onCefResource(const lucyn::cef_host::BrowserInstance::ResourceEvent& ev) {
+        using Ev = lucyn::cef_host::BrowserInstance::ResourceEvent;
+        if (ev.phase == Ev::Start) {
+            net::Capture cap = moonbug.begin(ev.method, ev.url, /*profile=*/"", /*impersonating=*/false);
+            std::lock_guard<std::mutex> lk(resMu_);
+            pendingRes_[ev.requestId] = std::move(cap);
+            return;
         }
-        for (auto* link : doc.getElementsByTagName("link")) {
-            const std::string* rel = link->attr("rel");
-            if (!rel) continue;
-            std::string relLower;
-            for (char c : *rel) relLower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (relLower.find("stylesheet") == std::string::npos) continue;
-            const std::string* href = link->attr("href");
-            if (!href || href->empty()) continue;
-            std::string abs = shell::resolveUrl(pageUrl, *href);
-            // Fetch via the HTTP client. We use the same `dest: style` path
-            // fetch/XHR uses, so adblock and impersonation apply.
-            net::RequestOptions o;
-            o.method = "GET";
-            o.pageUrl = pageUrl;
-            o.fetchMode = "no-cors";
-            o.fetchDest = "style";
-            o.requestType = adblock::RequestType::Stylesheet;
-            auto resp = client.request(abs, o);
-            if (!resp.ok() || resp.status < 200 || resp.status >= 300) continue;
-            stylesheet_->add(resp.body);
+        // Finish: pull the capture begun at Start and complete it.
+        net::Capture cap;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(resMu_);
+            auto it = pendingRes_.find(ev.requestId);
+            if (it != pendingRes_.end()) { cap = std::move(it->second); pendingRes_.erase(it); have = true; }
         }
+        if (!have) cap = moonbug.begin(ev.method, ev.url, "", false);  // Finish without a seen Start
+        cap.requestHeaders  = ev.requestHeaders;
+        cap.responseHeaders = ev.responseHeaders;
+        cap.finalUrl        = ev.url;
+        cap.status          = ev.status;
+        cap.responseBytes   = static_cast<std::size_t>(ev.bytes < 0 ? 0 : ev.bytes);
+        cap.redirects       = ev.redirects;
+        cap.httpVersion     = ev.httpVersion;
+        cap.error           = ev.error;
+        cap.done            = true;
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if (cap.tsMs > 0 && nowMs >= cap.tsMs) cap.timing.totalMs = static_cast<double>(nowMs - cap.tsMs);
+        moonbug.finish(cap);   // fires onResponse + onCapture → dashboard / events
     }
-#endif
-
-    // Set when the user closes the window; ends the command loop so the process exits.
-    std::atomic<bool> quitRequested_{false};
-
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-    // Ghostful Mode: created lazily by the first "window" command (or at
-    // startup if ControllerOptions ever grows a --show flag; not this
-    // session, see SESSION11.md), hidden by default. One window for the
-    // controller's whole lifetime, matching "one browser window" in practice.
-    std::unique_ptr<lucyn::ui::Window> window_;
-#endif
-#ifdef LUCYN_CONTROLLER_HAVE_LNM
-    std::unique_ptr<lucyn::lnm::App> lnmApp_;
-    lucyn::dom::Node* focusedLnmInput_ = nullptr;
 #endif
 
     std::istream& in;
@@ -614,16 +389,9 @@ struct Controller::Impl {
     explicit Impl(ControllerOptions o)
         : opts(std::move(o))
         , nullbyte(makeNullbyte(opts, &keyNote))
-        , sw(opts.initialProfile)
-        , client(sw)
-        , idStore(profile::IdentityStore::defaultDir())
-        , idm(sw, idStore)
         , in(opts.in ? *opts.in : std::cin)
         , out(opts.out ? *opts.out : std::cout)
     {
-        // No user scripts in M4 — the controller manages all commands directly.
-        // User scripts (nothing-data/scripts/) can be added later.
-        client.setMoonbug(&moonbug);
 #ifdef LUCYN_CONTROLLER_HAVE_SEARCH
         if (!opts.searxngUrl.empty()) {
             std::string instance = opts.searxngUrl;
@@ -667,31 +435,31 @@ struct Controller::Impl {
             }
         }
         adblocker.finalize();
-        if (opts.adblockEnabled) {
-            client.setRequestFilter([this](const std::string& url, const std::string& source, adblock::RequestType type) {
-                return adblocker.check(adblock::Request::build(url, source, type)).matched_rule;
-            });
-        }
-        client.setHeaderProvider([this](bool impersonating) { return personaHeaders(impersonating); });
         eventsOn = opts.captureEvents;
         eventTap = moonbug.onCapture([this](const net::Capture& c) { if (eventsOn) emit(requestEvent(c)); });
-        // Cookie persistence: load the jar for the initial profile, then track every switch.
-        if (opts.persistCookies) {
-            loadCookies(sw.current().target);
-            cookieListenerId_ = sw.subscribe([this](const profile::Profile& old, const profile::Profile& now) {
-                saveCookies(old.target);
-                loadCookies(now.target);
-            });
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        // Chromium instance — but ONLY when the host process initialised CEF. Unit
+        // tests never do, so engine commands report "no page loaded" there.
+        if (lucyn::cef_host::isCefInitialized()) {
+            cef_ = lucyn::cef_host::createInstance();
+            if (cef_)
+                cef_->setResourceHandler([this](const lucyn::cef_host::BrowserInstance::ResourceEvent& ev) {
+                    onCefResource(ev);
+                });
         }
+        // Session cookies: load nothing-data/cookies.json into Chromium's jar — this is
+        // what makes a login survive a new engine run. Needs cef_ (created just above).
+        loadCookiesJson();
+#endif
     }
 
     ~Impl() {
-        if (cookieListenerId_) sw.unsubscribe(cookieListenerId_);
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) cef_->setResourceHandler(nullptr);   // stop IO-thread callbacks before members die
+#endif
+        saveCookiesJson();                     // clean shutdown: write Chromium's jar back to cookies.json
         srv.reset();                          // stop listeners first
         moonbug.off(eventTap);
-        client.setHeaderProvider(nullptr);
-        client.setRequestFilter(nullptr);
-        client.setMoonbug(nullptr);
     }
 
     void emit(const std::string& line) {
@@ -737,122 +505,133 @@ struct Controller::Impl {
         return all;
     }
 
-    js::HostOptions makeJsHostOpts() {
-        js::HostOptions hopts;
-        hopts.scriptTimeoutMs = opts.settleTimeoutMs > 0 ? opts.settleTimeoutMs : 5000;
-        hopts.persona = [this]() -> std::optional<js::Persona> {
-            auto id = idm.identity();
-            auto su = idm.surface();
-            if (!id || !su) return std::nullopt;
-            return js::Persona{*su, id->device};
-        };
-        // ONE path for everything the page requests (fetch, XHR, <script src>): the full request with its page
-        // context goes to the client, which sends browser-correct subresource headers and the shared cookie jar.
-        hopts.httpFetch = [this](const js::HttpRequest& rq) -> js::HttpGetResult {
-            net::RequestOptions o;
-            o.method    = rq.method;
-            o.body      = rq.body;
-            o.hasBody   = rq.hasBody;
-            o.headers   = rq.headers;
-            o.pageUrl   = rq.pageUrl;
-            o.fetchMode = rq.mode;
-            o.fetchDest = rq.dest;
-            if (rq.dest == "script") o.requestType = adblock::RequestType::Script;
-            else if (rq.dest == "style") o.requestType = adblock::RequestType::Stylesheet;
-            else if (rq.dest == "image") o.requestType = adblock::RequestType::Image;
-            else if (rq.dest == "font") o.requestType = adblock::RequestType::Font;
-            else if (rq.dest == "audio" || rq.dest == "video") o.requestType = adblock::RequestType::Media;
-            else if (rq.dest == "document" || rq.dest == "iframe") o.requestType = adblock::RequestType::Subdocument;
-            else o.requestType = adblock::RequestType::XmlHttpRequest;
-            return toJs(client.request(rq.url, o));
-        };
-        // document.cookie reads and writes the SAME jar the HTTP requests use (HttpOnly cookies stay invisible to scripts).
-        hopts.cookieGet = [this](const std::string& pageUrl) { return client.cookieStringFor(pageUrl); };
-        hopts.cookieSet = [this](const std::string& pageUrl, const std::string& cookie) { client.setCookieFromScript(pageUrl, cookie); };
-        if (opts.onConsole) hopts.onConsole = opts.onConsole;
-        return hopts;
-    }
-
-    static js::HttpGetResult toJs(net::Response r) {
-        js::HttpGetResult res;
-        res.status       = r.status;
-        res.body         = std::move(r.body);
-        res.headers      = std::move(r.headers);
-        res.effectiveUrl = std::move(r.effectiveUrl);
-        res.error        = std::move(r.error);
-        res.redirects    = r.redirects;
-        res.statusText   = std::move(r.statusText);
-        res.httpVersion  = std::move(r.httpVersion);
-        return res;
-    }
-
-    // Headers the active identity puts on EVERY request. Called from worker threads (IdentityManager is
-    // mutex-guarded). With libcurl-impersonate the library already sends the whole browser set in the right
-    // order, so only what the library cannot know is added: Accept-Language, from the same Surface that feeds
-    // navigator.languages (so the header and the page can never disagree). User-Agent and Sec-CH-UA are NOT
-    // overridden there: a second opinion could only break the match with the TLS fingerprint. On stock libcurl
-    // nothing is sent by default (not even a browser User-Agent), so the persona's headers fill that in.
-    net::HeaderList personaHeaders(bool impersonating) {
-        net::HeaderList h;
-        auto su = idm.surface();
-        if (!su) return h;
-        if (!su->acceptLanguage.empty()) h.emplace_back("Accept-Language", su->acceptLanguage);
-        if (!impersonating) {
-            if (!su->userAgent.empty()) h.emplace_back("User-Agent", su->userAgent);
-            if (!su->secChUa.empty()) {
-                h.emplace_back("Sec-CH-UA", su->secChUa);
-                h.emplace_back("Sec-CH-UA-Mobile", su->secChUaMobile);
-                h.emplace_back("Sec-CH-UA-Platform", "\"" + su->secChUaPlatform + "\"");
-            }
-        }
-        return h;
-    }
-
-    // ---- Cookie persistence helpers -----------------------------------------------------------------
-
-    // Path for the cookie file for the given profile name.
-    static std::string cookieFilePath(const std::string& profile) {
-        return core::dataDir("cookies") + "/" + profile + ".txt";
-    }
-
-    // Save the current jar to disk (only when persistCookies is on).
-    void saveCookies(const std::string& profile) {
-        if (!opts.persistCookies || profile.empty()) return;
-        std::string text = client.exportCookieFile();
-        std::string path = cookieFilePath(profile);
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (f) f << text;
-    }
-
-    // Load cookies from disk into the current jar (only when persistCookies is on).
-    void loadCookies(const std::string& profile) {
-        if (!opts.persistCookies || profile.empty()) return;
-        std::string path = cookieFilePath(profile);
-        std::ifstream f(path, std::ios::binary);
-        if (!f) return;
-        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        client.importCookieFile(text);
-    }
-
-    static std::string cookieJson(const net::Cookie& c) {
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+    static std::string cookieJson(const lucyn::cef_host::BrowserInstance::Cookie& c) {
         return "{\"name\":\"" + jsonEsc(c.name) + "\",\"value\":\"" + jsonEsc(c.value) + "\",\"domain\":\"" + jsonEsc(c.domain) +
                "\",\"path\":\"" + jsonEsc(c.path) + "\",\"hostOnly\":" + (c.hostOnly ? "true" : "false") +
                ",\"secure\":" + (c.secure ? "true" : "false") + ",\"httpOnly\":" + (c.httpOnly ? "true" : "false") +
                ",\"expires\":" + std::to_string(c.expires) + "}";
     }
+#endif
+
+    // Split a JSON array text into its top-level {...} element strings (string/escape aware, so a
+    // '}' inside a cookie value doesn't cut the object short).
+    static std::vector<std::string> jsonObjectItems(const std::string& text) {
+        std::vector<std::string> items;
+        size_t open = text.find('[');
+        if (open == std::string::npos) return items;
+        std::string cur;
+        int depth = 0;
+        bool inStr = false;
+        for (size_t i = open + 1; i < text.size(); ++i) {
+            char c = text[i];
+            if (inStr) {
+                cur += c;
+                if (c == '\\' && i + 1 < text.size()) { cur += text[++i]; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"')       { inStr = true; cur += c; }
+            else if (c == '{')  { ++depth; cur += c; }
+            else if (c == '}')  { --depth; cur += c; if (depth == 0) { items.push_back(cur); cur.clear(); } }
+            else if (depth > 0) cur += c;
+        }
+        return items;
+    }
+
+    // nothing-data/cookies.json: the jar as the same objects `cookies` returns, so the JS client
+    // can read and write it too. Loaded into Chromium's jar at startup (once cef_ exists) and
+    // written back on clean shutdown.
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+    void loadCookiesJson() {
+        if (!cef_) return;
+        std::string path = core::dataRoot() + "/cookies.json";
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return;
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        long long now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        for (const std::string& item : jsonObjectItems(text)) {
+            lucyn::cef_host::BrowserInstance::Cookie c;
+            c.name     = jsonGetStr(item, "name");
+            c.value    = jsonGetStr(item, "value");
+            c.domain   = jsonGetStr(item, "domain");
+            if (c.name.empty() || c.domain.empty()) continue;
+            std::string cpath = jsonGetStr(item, "path");
+            if (!cpath.empty()) c.path = cpath;
+            c.hostOnly = jsonGetBool(item, "hostOnly") != 0;   // like cmdSetCookie: default host-only
+            c.secure   = jsonGetBool(item, "secure") == 1;
+            c.httpOnly = jsonGetBool(item, "httpOnly") == 1;
+            long long exp = jsonGetInt(item, "expires");
+            c.expires  = exp > 0 ? exp : 0;
+            if (c.expires > 0 && c.expires <= now) continue;   // expired while we were away
+            // Chromium scopes a cookie by URL: synthesize one from the domain (https when secure).
+            const std::string targetUrl = (c.secure ? "https://" : "http://") + c.domain + "/";
+            bool done = false;
+            cef_->setCookie(targetUrl, c, [&](bool, const std::string&, const std::string&) { done = true; });
+            cefWait([&] { return done; }, 5000);   // best-effort: a rejected cookie is simply skipped
+        }
+    }
+#endif
+
+    void saveCookiesJson() {
+        std::string root = core::dataRoot();
+        if (root.empty()) return;
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);         // dataRoot() is not created until asked
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (!cef_) return;
+        bool done = false, ok = false;
+        std::vector<lucyn::cef_host::BrowserInstance::Cookie> list;
+        cef_->allCookies("", [&](bool o,
+                                 const std::vector<lucyn::cef_host::BrowserInstance::Cookie>& cl,
+                                 const std::string&) {
+            done = true; ok = o; list = cl;
+        });
+        if (!cefWait([&] { return done; }, 15000) || !ok) return;
+        std::string s = "[";
+        for (size_t i = 0; i < list.size(); ++i) { if (i) s += ','; s += cookieJson(list[i]); }
+        s += "]";
+        std::ofstream f(root + "/cookies.json", std::ios::binary | std::ios::trunc);
+        if (f) f << s;
+#endif
+    }
 
     // cookies {url?}: with a url, exactly what a request to it would carry (HttpOnly included); without, the whole jar.
+    // Backed by Chromium's cookie store — the jar a CEF page actually uses.
     std::string cmdCookies(long long id, const std::string& url) {
-        std::vector<net::Cookie> list = url.empty() ? client.cookies() : client.cookiesFor(url, true);
-        std::string s = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"cookies\":[";
-        for (size_t i = 0; i < list.size(); ++i) { if (i) s += ','; s += cookieJson(list[i]); }
-        return s + "]}";
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, ok = false;
+            std::vector<lucyn::cef_host::BrowserInstance::Cookie> cefList;
+            std::string err;
+            cef_->allCookies(url, [&](bool o,
+                                      const std::vector<lucyn::cef_host::BrowserInstance::Cookie>& cl,
+                                      const std::string& e) {
+                done = true; ok = o; cefList = cl; err = e;
+            });
+            if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout reading cookies");
+            if (!ok) return replyErr(id, err.empty() ? "cannot read cookies" : err);
+            std::string s = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"cookies\":[";
+            for (size_t i = 0; i < cefList.size(); ++i) {
+                if (i) s += ',';
+                s += cookieJson(cefList[i]);
+            }
+            return s + "]}";
+        }
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        (void)url;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     // setCookie {name, value, domain | url, path?, secure?, httpOnly?, expires?}: import a session. An `expires`
     // in the past deletes the cookie.
     std::string cmdSetCookie(long long id, const std::string& line) {
-        net::Cookie c;
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (!cef_) return replyErr(id, "no browser instance (CEF not initialised)");
+        lucyn::cef_host::BrowserInstance::Cookie c;
         c.name  = jsonGetStr(line, "name");
         c.value = jsonGetStr(line, "value");
         c.domain = jsonGetStr(line, "domain");
@@ -872,141 +651,65 @@ struct Controller::Impl {
         c.httpOnly = jsonGetBool(line, "httpOnly") == 1;
         long long exp = jsonGetInt(line, "expires");
         c.expires  = exp > 0 ? exp : 0;                            // missing / 0 = session cookie; a past time deletes
-        if (!client.setCookie(c)) return replyErr(id, "cookie rejected (bad characters or no domain)");
+        // SetCookie needs a URL to scope by: use the caller's, or synthesize from the domain.
+        const std::string targetUrl = url.empty() ? ((c.secure ? "https://" : "http://") + c.domain + "/") : url;
+        bool done = false, ok = false;
+        std::string err2;
+        cef_->setCookie(targetUrl, c, [&](bool o, const std::string&, const std::string& e) {
+            done = true; ok = o; err2 = e;
+        });
+        if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout setting cookie");
+        if (!ok) return replyErr(id, err2.empty() ? "cookie rejected (bad characters or no domain)" : err2);
         return replyOk(id);
+#else
+        (void)line;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     // ---- command handlers ---------------------------------------------------
 
-    // The most pages one visit()/click()/eval() will load by following what each page asks for (location.href, reload, a
-    // submitted form, a meta refresh). A JS challenge needs one or two; the cap stops a page that redirects to itself forever.
-    static constexpr int kMaxNavHops = 8;
-
-    // Loads `first` (GET, or POST for a submitted form) and then keeps following whatever the page asks for until it settles on a
-    // page that stays. Cookies live in the one shared jar, so a challenge page that sets a cookie and reloads gets the real page on
-    // the second hop. Returns "" on success (lastResult/jsHost_ describe the final page) or an error message.
-    // `referrer` is the URL of the page that started this navigation ("" for the address bar).
-    std::string loadPageFollowing(js::Navigation next, std::string referrer) {
-        for (int hop = 0;; ++hop) {
-            // Tear down any existing live JS context (host first: it points into the document).
-            jsHost_.reset();
-            lastResult.reset();
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
-            renderOverride_.reset();
-#endif
-            const std::string hopUrl = next.url;
-            shell::Fetcher fetcher = [this, next, referrer](const std::string& u) {
-                shell::FetchResult r;
-                net::RequestOptions o;
-                if (u == next.url && next.method == "POST") {
-                    o.method  = "POST";
-                    o.body    = next.body;
-                    o.hasBody = true;
-                    if (!next.contentType.empty()) o.headers.emplace_back("Content-Type", next.contentType);
-                    const std::string origin = originOfUrl(referrer);
-                    if (!origin.empty()) o.headers.emplace_back("Origin", origin);
-                }
-                const std::string ref = referrerFor(referrer, u);
-                if (!ref.empty()) o.headers.emplace_back("Referer", ref);
-                auto resp = client.request(u, o);
-                r.ok       = resp.ok();
-                r.status   = resp.status;
-                r.body     = std::move(resp.body);
-                r.finalUrl = resp.effectiveUrl;
-                r.error    = resp.error;
-                return r;
-            };
-
-            // Build JS host as a persistent member so it survives across commands.
-            jsHost_ = std::make_unique<js::QuickJsHost>(makeJsHostOpts());
-
-            shell::Hydrator hy(fetcher, scripts, *jsHost_);
-            hy.options.saveSnapshots    = false;
-            hy.options.settleTimeoutMs  = opts.settleTimeoutMs > 0 ? opts.settleTimeoutMs : 5000;
-            hy.options.keepAlive        = true;   // do NOT detach after settle(); eval/waitFor need the live context
-
-            auto result = hy.hydrate(hopUrl);
-            if (!result.ok) {
-                jsHost_.reset();
-                return result.error.empty() ? "navigation failed: " + hopUrl : result.error;
-            }
-
-            // Emit notes and page errors as events.
-            for (auto& n : jsHost_->notes())
-                emit(eventLine("note", n));
-            for (auto& e : jsHost_->pageErrors())
-                emit(eventLine("pageError", e));
-
-            lastUrl    = result.url;
-            lastResult = std::move(result);
-
-            // Did the page ask to go somewhere? (script first, then a <meta refresh>)
-            std::optional<js::Navigation> want = jsHost_->takeNavigation();
-            if (!want && lastResult->document) want = metaRefreshOf(*lastResult->document, lastResult->url);
-            if (!want) break;
-            if (hop + 1 >= kMaxNavHops) {
-                emit(eventLine("note", "stopped after " + std::to_string(kMaxNavHops) + " page loads; the page still wants " +
-                                           want->method + " " + want->url));
-                break;
-            }
-            emit(eventLine("note", "page navigated: " + want->method + " " + want->url));
-            referrer = lastResult->url;
-            next     = *want;
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+    // Bridge async CEF completions into the synchronous command loop: pump the
+    // instance until `done` or timeout. Only used when cef_ is present (CEF up).
+    bool cefWait(const std::function<bool()>& done, int timeoutMs) {
+        if (!cef_) return false;
+        const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (!done() && std::chrono::steady_clock::now() < dl) {
+            cef_->pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
-        // Build the stylesheet before chooseRenderDocument() so the blank-page
-        // guard sees the same styles as the eventual screenshot. The sheet is
-        // rebuilt on every visit (styles can change between pages).
-        if (lastResult && lastResult->document) buildStylesheetFor(*lastResult->document, lastResult->url);
-        chooseRenderDocument();
-#endif
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-        presentCurrentView();
-#endif
-
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-        // A freshly-created jsHost_ starts the new page at the prelude's own
-        // default (__lucynHidden = true); sync it to the real window's actual
-        // current state immediately, so a page loaded while the window is
-        // already visible does not briefly/incorrectly report itself hidden.
-        pushVisibilityToPage();
-#endif
-
-        // Persist cookies acquired during the page load (Set-Cookie headers).
-        saveCookies(sw.current().target);
-        return {};
+        cef_->pump();
+        return done();
     }
+#endif
 
-    // A click, eval or wait can make the live page ask to navigate (a link, a submit button, location.href = ...).
-    // Follows it and returns "" (nothing to follow, or it loaded) or an error message.
-    std::string followPageNavigation() {
-        if (!jsHost_) return {};
-        auto nav = jsHost_->takeNavigation();
-        if (!nav) return {};
-        emit(eventLine("note", "page navigated: " + nav->method + " " + nav->url));
-        return loadPageFollowing(*nav, lastResult ? lastResult->url : std::string());
-    }
-
-    std::string cmdVisit(long long id, const std::string& url, const std::string& profile) {
-        // Switch profile if requested.
-        if (!profile.empty()) {
-            std::string err;
-            if (!sw.select(profile, &err))
-                return replyErr(id, "profile switch failed: " + err);
+    std::string cmdVisit(long long id, const std::string& url) {
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, ok = false;
+            int status = 0;
+            std::string title, err;
+            {   // drop in-flight resource captures left over from any previous page
+                std::lock_guard<std::mutex> lk(resMu_);
+                pendingRes_.clear();
+            }
+            cef_->visit(url, [&](bool o, int s, const std::string& t, const std::string& e) {
+                done = true; ok = o; status = s; title = t; err = e;
+            });
+            if (!cefWait([&] { return done; }, 30000)) return replyErr(id, "timeout loading page");
+            if (!ok) return replyErr(id, err.empty() ? "load failed" : err);
+            const std::string finalUrl = cef_->currentUrl();
+            lastUrl = finalUrl;
+            return "{\"id\":" + std::to_string(id) + ",\"ok\":true"
+                   ",\"status\":" + std::to_string(status) +
+                   ",\"url\":\"" + jsonEsc(finalUrl) + "\""
+                   ",\"title\":\"" + jsonEsc(title) + "\"}";
         }
-
-        js::Navigation first;
-        first.url = url;
-        std::string err = loadPageFollowing(first, {});
-        if (!err.empty()) return replyErr(id, err);
-
-        // Reply with status + title.
-        std::string r = "{\"id\":" + std::to_string(id) + ",\"ok\":true"
-                        ",\"status\":" + std::to_string(lastResult->status) +
-                        ",\"url\":\"" + jsonEsc(lastResult->url) + "\""
-                        ",\"title\":\"" + jsonEsc(lastResult->title) + "\"}";
-        return r;
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        return replyErr(id, "built without CEF");
+#endif
     }
 
 #ifdef LUCYN_CONTROLLER_HAVE_SEARCH
@@ -1018,105 +721,216 @@ struct Controller::Impl {
         std::string error;
         auto target = searchEngines.url(engine, query, &error);
         if (!target) return replyErr(id, error);
-        return cmdVisit(id, *target, {});
+        return cmdVisit(id, *target);
     }
 #endif
 
     std::string cmdHtml(long long id) {
-        if (!lastResult) return replyErr(id, "no page loaded");
-        return replyValue(id, lastResult->afterHtml);
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, ok = false;
+            std::string val, err;
+            cef_->html([&](bool o, const std::string& v, const std::string& e) { done = true; ok = o; val = v; err = e; });
+            if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout reading html");
+            if (!ok) return replyErr(id, err.empty() ? "no page loaded" : err);
+            return replyValue(id, val);
+        }
+        return replyErr(id, "no page loaded (no browser instance; CEF not initialised)");
+#else
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     std::string cmdExtract(long long id, const std::string& selector) {
-        if (!lastResult || !lastResult->document)
-            return replyErr(id, "no page loaded");
-        auto v = queryOne(*lastResult->document, selector);
-        if (!v) return replyErr(id, "selector not found: " + selector);
-        return replyValue(id, *v);
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, found = false;
+            std::string val;
+            cef_->extract(selector, [&](bool f, const std::string& v) { done = true; found = f; val = v; });
+            if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout extracting");
+            if (!found) return replyErr(id, "selector not found: " + selector);
+            return replyValue(id, val);
+        }
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        (void)selector;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     std::string cmdExtractAll(long long id, const std::string& selector) {
-        if (!lastResult || !lastResult->document)
-            return replyErr(id, "no page loaded");
-        auto values = queryAll(*lastResult->document, selector);
-        return replyValues(id, values);
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, ok = false;
+            std::vector<std::string> vals;
+            std::string err;
+            cef_->extractAll(selector, [&](bool o, const std::vector<std::string>& v, const std::string& e) { done = true; ok = o; vals = v; err = e; });
+            if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout extracting");
+            if (!ok) return replyErr(id, err.empty() ? "extract failed" : err);
+            return replyValues(id, vals);
+        }
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        (void)selector;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     std::string cmdEval(long long id, const std::string& js) {
-        if (!jsHost_) return replyErr(id, "no page loaded; call visit() first");
-        std::string result, error;
-        if (!jsHost_->eval(js, &result, &error))
-            return replyErr(id, error);
-        std::string navErr = followPageNavigation();      // eval("location.reload()") and friends really navigate now
-        if (!navErr.empty()) return replyErr(id, navErr);
-        return replyValue(id, result);
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, ok = false;
+            std::string val, err;
+            cef_->eval(js, [&](bool o, const std::string& v, const std::string& e) { done = true; ok = o; val = v; err = e; });
+            if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout evaluating");
+            if (!ok) return replyErr(id, err.empty() ? "eval failed" : err);
+            return replyValue(id, val);
+        }
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        (void)js;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     std::string cmdWaitFor(long long id, const std::string& selector, int timeoutMs) {
-        if (!lastResult || !lastResult->document)
-            return replyErr(id, "no page loaded");
-        if (!jsHost_)
-            return replyErr(id, "JS context not available");
-        if (timeoutMs <= 0) timeoutMs = opts.settleTimeoutMs > 0 ? opts.settleTimeoutMs : 5000;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-        for (;;) {
-            // pump timers + jobs so dynamic content can render
-            jsHost_->settle(50);
-            if (lastResult->document->querySelector(selector))
-                return replyValue(id, selector);
-            if (std::chrono::steady_clock::now() >= deadline)
-                return replyErr(id, "timeout waiting for selector: " + selector);
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            // CEF path: poll the LIVE page (Chromium is the JS engine, so there is
+            // no lastResult/jsHost_ to read). Each probe is an eval round-trip that
+            // returns "true"/"false" for whether the selector is present yet.
+            if (timeoutMs <= 0) timeoutMs = opts.settleTimeoutMs > 0 ? opts.settleTimeoutMs : 5000;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+            const std::string probe = "!!document.querySelector(" + jsonStringLiteral(selector) + ")";
+            for (;;) {
+                bool done = false, present = false;
+                cef_->eval(probe, [&](bool ok, const std::string& v, const std::string&) {
+                    done = true; present = ok && v == "true";
+                });
+                if (!cefWait([&] { return done; }, 15000))
+                    return replyErr(id, "timeout waiting for selector: " + selector);
+                if (present) return replyValue(id, selector);
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return replyErr(id, "timeout waiting for selector: " + selector);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let the page render
+            }
         }
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        (void)selector; (void)timeoutMs;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     std::string cmdWaitIdle(long long id, int quietMs, int timeoutMs) {
         if (quietMs <= 0)   quietMs   = 500;
         if (timeoutMs <= 0) timeoutMs = opts.settleTimeoutMs > 0 ? opts.settleTimeoutMs : 5000;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        // The quiet window alone isn't enough: heavy XHR/fetch pages fire their next request right
+        // after the initial burst settles, so the page still looks empty the moment we reply. After
+        // the first quiet window passes, hold a short confirmation window too and make sure no new
+        // request started in the meantime; any activity sends us back to a full fresh quiet window.
+        // The caller's timeout still caps the whole wait.
+        const long long confirmMs = std::min<long long>(quietMs, 300);
         size_t prevTotal = moonbug.total();
-        auto quiteStart = std::chrono::steady_clock::now();
+        auto quietStart = std::chrono::steady_clock::now();
+        bool confirming = false;
         for (;;) {
-            if (jsHost_) jsHost_->settle(50);
-            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));   // let CEF's IO thread feed Moonbug
             size_t nowTotal = moonbug.total();
             // A request that is still running is not "quiet": without this a slow response looked idle.
-            if (nowTotal != prevTotal || moonbug.inFlight() > 0) { prevTotal = nowTotal; quiteStart = std::chrono::steady_clock::now(); }
-            auto quiet = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - quiteStart).count();
-            if (quiet >= quietMs) return replyOk(id);
+            if (nowTotal != prevTotal || moonbug.inFlight() > 0) {
+                prevTotal  = nowTotal;
+                quietStart = std::chrono::steady_clock::now();
+                confirming = false;              // activity: restart both windows
+            }
+            auto quiet = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - quietStart).count();
+            if (!confirming && quiet >= quietMs) { confirming = true; quietStart = std::chrono::steady_clock::now(); }
+            else if (confirming && quiet >= confirmMs) return replyOk(id);
             if (std::chrono::steady_clock::now() >= deadline)
                 return replyErr(id, "timeout waiting for network idle");
         }
     }
 
     std::string cmdClick(long long id, const std::string& selector) {
-        if (!jsHost_) return replyErr(id, "no page loaded");
-        // Use eval to call .click() on the element, then settle briefly.
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            bool done = false, ok = false;
+            std::string val, err;
+            cef_->click(selector, [&](bool o, const std::string& v, const std::string& e) { done = true; ok = o; val = v; err = e; });
+            if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout clicking");
+            if (!ok) return replyErr(id, err.empty() ? "click failed" : err);
+            return replyValue(id, val);
+        }
+        return replyErr(id, "no browser instance (CEF not initialised)");
+#else
+        (void)selector;
+        return replyErr(id, "built without CEF");
+#endif
+    }
+
+    // fill {selector, value}: set the element's value, then dispatch bubbling `input` and
+    // `change` events — that order (input, then change) is what browsers do and what
+    // React/Vue/Alpine listeners expect. Chromium runs the JS; the reply is the tag name.
+    std::string cmdFill(long long id, const std::string& selector, const std::string& value) {
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (!cef_) return replyErr(id, "no browser instance (CEF not initialised)");
         std::string code =
             "(function(){"
             "  var el = document.querySelector(" + jsonStringLiteral(selector) + ");"
             "  if (!el) throw new Error('selector not found: ' + " + jsonStringLiteral(selector) + ");"
-            "  el.click();"
-            "  return el.tagName || 'OK';"
+            "  el.value = " + jsonStringLiteral(value) + ";"
+            "  el.dispatchEvent(new InputEvent('input', { bubbles: true }));"
+            "  el.dispatchEvent(new Event('change', { bubbles: true }));"
+            "  return String(el.tagName || '').toLowerCase();"
             "})()";
-        std::string result, error;
-        if (!jsHost_->eval(code, &result, &error))
-            return replyErr(id, error);
-        jsHost_->settle(200);
-        std::string navErr = followPageNavigation();      // a clicked link / submit button loads its page
-        if (!navErr.empty()) return replyErr(id, navErr);
-        return replyValue(id, result);
+        bool done = false, ok = false;
+        std::string val, err;
+        cef_->eval(code, [&](bool o, const std::string& v, const std::string& e) { done = true; ok = o; val = v; err = e; });
+        if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout filling element");
+        if (!ok) return replyErr(id, err.empty() ? "fill failed" : err);
+        return replyTag(id, val);
+#else
+        (void)selector; (void)value;
+        return replyErr(id, "built without CEF");
+#endif
+    }
+
+    // submit {selector}: a form submits itself (browser-style: no submit event, just navigate);
+    // an input/button inside a form gets a real .click() — its default action routes through
+    // requestSubmit(), so the page's submit handler runs first and can cancel. Chromium follows
+    // the navigation natively; we give it a moment to settle.
+    std::string cmdSubmit(long long id, const std::string& selector) {
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (!cef_) return replyErr(id, "no browser instance (CEF not initialised)");
+        std::string code =
+            "(function(){"
+            "  var el = document.querySelector(" + jsonStringLiteral(selector) + ");"
+            "  if (!el) throw new Error('selector not found: ' + " + jsonStringLiteral(selector) + ");"
+            "  var tag = String(el.tagName || '').toLowerCase();"
+            "  if (tag === 'form') { el.submit(); }"
+            "  else { el.click(); }"
+            "  return tag;"
+            "})()";
+        bool done = false, ok = false;
+        std::string val, err;
+        cef_->eval(code, [&](bool o, const std::string& v, const std::string& e) { done = true; ok = o; val = v; err = e; });
+        if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout submitting form");
+        if (!ok) return replyErr(id, err.empty() ? "submit failed" : err);
+        // A submitted form navigates; give Chromium a moment to follow it so the next
+        // command (html/extract) sees the destination page, as the old funnel did.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        cef_->pump();
+        return replyTag(id, val);
+#else
+        (void)selector;
+        return replyErr(id, "built without CEF");
+#endif
     }
 
     // Helper: wrap a C++ string as a JS string literal (safe for inline eval).
     static std::string jsonStringLiteral(const std::string& s) {
         return "\"" + jsonEsc(s) + "\"";
-    }
-
-    std::string cmdProfile(long long id, const std::string& name) {
-        std::string err;
-        if (!sw.select(name, &err))
-            return replyErr(id, "profile switch failed: " + err);
-        return replyValue(id, sw.current().target);
     }
 
     std::string cmdMoonbug(long long id, const std::string& line) {
@@ -1169,101 +983,62 @@ struct Controller::Impl {
         std::error_code ec;
         fs::create_directories(fs::u8path(dir), ec);
 
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (!cef_) return replyErr(id, "no browser instance (CEF not initialised)");
+        // Chromium fetches the body (same cookie jar + identity as a page). The body is
+        // buffered (capped at maxBytes) and written to a hidden temp file, then renamed
+        // into place only after a complete 2xx transfer — a failed or killed download
+        // never leaves something that looks like a finished file.
         static std::atomic<unsigned> counter{0};
         const fs::path tmp = fs::u8path(dir) / (".download-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
             std::to_string(counter++) + ".part");
 
-        struct Sink { std::ofstream f; unsigned long long n = 0; bool tooBig = false, diskErr = false; } sk;
-        net::RequestOptions ro;
-        ro.requestType = adblock::RequestType::Other;
-        ro.timeoutSec = 0;                       // big files take longer than the 30 s page default
-        if (!referer.empty()) ro.headers.emplace_back("Referer", referer);
-        ro.bodySink = [&](const char* d, size_t len) {
-            if (maxBytes > 0 && sk.n + len > (unsigned long long)maxBytes) { sk.tooBig = true; return false; }
-            if (!sk.f.is_open()) {
-                sk.f.open(tmp, std::ios::binary | std::ios::trunc);
-                if (!sk.f) { sk.diskErr = true; return false; }
-            }
-            sk.f.write(d, (std::streamsize)len);
-            if (!sk.f) { sk.diskErr = true; return false; }
-            sk.n += len;
-            return true;
-        };
-
-        net::Response r = client.request(url, ro);
-        if (sk.f.is_open()) { sk.f.close(); if (sk.f.fail()) sk.diskErr = true; }
+        bool done = false;
+        lucyn::cef_host::BrowserInstance::FetchResult fr;
+        cef_->fetchBody(url, maxBytes, referer,
+                        [&](const lucyn::cef_host::BrowserInstance::FetchResult& r) { done = true; fr = r; });
+        if (!cefWait([&] { return done; }, 120000)) { fs::remove(tmp, ec); return replyErr(id, "timeout downloading"); }
         auto fail = [&](const std::string& msg) { fs::remove(tmp, ec); return replyErr(id, msg); };
 
-        if (sk.tooBig)  return fail("download is larger than maxBytes (" + std::to_string(maxBytes) + ")");
-        if (sk.diskErr) return fail("cannot write to the downloads folder");
-        if (!r.ok())    return fail(r.error);
-        if (r.status < 200 || r.status >= 300)
-            return fail("HTTP " + std::to_string(r.status) + (r.statusText.empty() ? "" : " " + r.statusText));
+        if (fr.truncated) return fail("download is larger than maxBytes (" + std::to_string(maxBytes) + ")");
+        if (!fr.ok)       return fail(fr.error.empty() ? "download failed" : fr.error);
 
-        if (!fs::exists(tmp, ec)) {              // a 2xx with an empty body: the sink never ran
+        {   // write the fetched body (possibly empty) to the temp file
             std::ofstream z(tmp, std::ios::binary | std::ios::trunc);
+            if (!z) return fail("cannot write to the downloads folder");
+            if (!fr.body.empty()) z.write(fr.body.data(), (std::streamsize)fr.body.size());
             if (!z) return fail("cannot write to the downloads folder");
         }
 
-        if (chosen.empty()) chosen = sanitizeFileName(contentDispositionName(headerValue(r, "content-disposition")));
-        if (chosen.empty()) chosen = sanitizeFileName(urlLastSegment(r.effectiveUrl.empty() ? url : r.effectiveUrl));
+        if (chosen.empty()) chosen = sanitizeFileName(contentDispositionName(fr.contentDisposition));
+        if (chosen.empty()) chosen = sanitizeFileName(urlLastSegment(fr.finalUrl.empty() ? url : fr.finalUrl));
         if (chosen.empty()) chosen = "download.bin";
 
         fs::path finalPath = uniqueDownloadPath(dir, chosen, overwrite);
         fs::rename(tmp, finalPath, ec);
         if (ec) return fail("cannot move the finished download into place: " + ec.message());
 
-        const std::string ct = headerValue(r, "content-type");
-        const std::string type = lowerAscii(trimWs(ct.substr(0, ct.find(';'))));
+        const std::string type = lowerAscii(trimWs(fr.contentType.substr(0, fr.contentType.find(';'))));
         return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"path\":\"" + jsonEsc(finalPath.generic_u8string()) +
                "\",\"name\":\"" + jsonEsc(finalPath.filename().generic_u8string()) +
-               "\",\"bytes\":" + std::to_string(r.bodyBytes) +
-               ",\"status\":" + std::to_string(r.status) +
+               "\",\"bytes\":" + std::to_string(fr.bytes) +
+               ",\"status\":" + std::to_string(fr.status) +
                ",\"type\":\"" + jsonEsc(type) +
-               "\",\"url\":\"" + jsonEsc(r.effectiveUrl.empty() ? url : r.effectiveUrl) + "\"}";
-    }
-
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
-    // ---- screenshot: render the current page through layout + SoftwarePainter, offscreen -------------------
-    // No SDL and no display needed (SESSION11_PLAN.md: "This must work with no SDL and no display"), so this
-    // works in a sandbox with no GPU, same as every other command.
-    // The document the painter should draw: the live page unless it would paint blank (see chooseRenderDocument).
-    const lucyn::dom::Document& renderDocument() const {
-        return renderOverride_ ? *renderOverride_ : *lastResult->document;
-    }
-
-    // Blank-page guard. Order: live page -> the HTML the server sent -> a readable text view. Always leaves the
-    // window showing *something* and says why in a "note" event, so a white window is never a mystery again.
-    void chooseRenderDocument(float w = 0, float h = 0) {
-        renderOverride_.reset();
-        renderReason_.clear();
-        if (!lastResult || !lastResult->document) return;
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-        if (w <= 0 && window_) { w = static_cast<float>(window_->width()); h = static_cast<float>(window_->height()); }
+               "\",\"url\":\"" + jsonEsc(fr.finalUrl.empty() ? url : fr.finalUrl) + "\"}";
+#else
+        (void)overwrite; (void)maxBytes; (void)referer;
+        return replyErr(id, "built without CEF");
 #endif
-        if (w <= 0) { w = 800.0f; h = 600.0f; }
-        if (documentPaintsContent(*lastResult->document, w, h)) return;
-
-        auto before = lucyn::dom::parseHtml(lastResult->beforeHtml);
-        const size_t liveText = lastResult->document->body() ? lastResult->document->body()->textContent().size() : 0;
-        const size_t bodyBytes = lastResult->beforeHtml.size();
-        if (documentPaintsContent(*before, w, h)) {
-            renderReason_ = "page painted blank after scripts ran; showing the HTML the server sent";
-            renderOverride_ = std::move(before);
-        } else {
-            renderReason_ = "page has nothing LucyN can paint";
-            renderOverride_ = buildReadableFallback(before.get(), lastResult->url, lastResult->status,
-                                                    lastResult->title, bodyBytes, renderReason_);
-        }
-        emit(eventLine("note", "render guard: " + renderReason_ + " (live body text " + std::to_string(liveText) +
-                       " chars, server HTML " + std::to_string(bodyBytes) + " bytes, HTTP " +
-                       std::to_string(lastResult->status) + ")"));
     }
 
-    std::string cmdScreenshot(long long id, const std::string& line) {
-        if (!lastResult || !lastResult->document) return replyErr(id, "no page loaded");
 
+
+    // ---- screenshot: capture Chromium's offscreen frame to a PNG (Session 19 step 7) -------
+    // Drives the OSR renderer; no layout/paint of our own and no window ever exists.
+    std::string cmdScreenshot(long long id, const std::string& line) {
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (!cef_) return replyErr(id, "no browser instance (CEF not initialised)");
         std::string chosen;
         const std::string wanted = jsonGetStr(line, "name");
         if (!wanted.empty()) {
@@ -1277,340 +1052,25 @@ struct Controller::Impl {
         if (dir.empty()) return replyErr(id, "cannot resolve the screenshots folder");
         std::error_code ec;
         fs::create_directories(fs::u8path(dir), ec);
+        const fs::path finalPath = uniqueDownloadPath(dir, chosen, /*overwrite=*/false);
 
-        const long long reqWidth = jsonGetInt(line, "width");
-        lucyn::layout::LayoutOptions opts;
-        opts.viewportWidth = reqWidth > 0 ? static_cast<float>(reqWidth) : 800.0f;
-
-        if (!renderOverride_ && !documentPaintsContent(*lastResult->document, opts.viewportWidth, 600.0f))
-            chooseRenderDocument(opts.viewportWidth, 600.0f);
-
-#ifdef LUCYN_HAVE_LITEHTML
-        lucyn::layout::LitehtmlRenderer lhRenderer(static_cast<int>(opts.viewportWidth), 600);
-        lhRenderer.loadHtml(renderDocument().root().outerHTML(), "");
-        lhRenderer.render();
-        const lucyn::paint::DisplayList& displayList = lhRenderer.displayList();
-        int height = static_cast<int>(lhRenderer.documentHeight()) > 0
-                     ? static_cast<int>(lhRenderer.documentHeight()) + 20 : 600;
-        lucyn::paint::Framebuffer fb;
-        fb.init(static_cast<int>(opts.viewportWidth), height, lucyn::paint::packRGBA(255, 255, 255, 255));
-        lucyn::paint::SoftwarePainter painter(fb, &lhRenderer.imageTable());
-        painter.draw(displayList);
+        bool done = false, ok = false;
+        std::string val, err;
+        cef_->screenshot(finalPath.u8string(), [&](bool o, const std::string& v, const std::string& e) {
+            done = true; ok = o; val = v; err = e;
+        });
+        if (!cefWait([&] { return done; }, 15000)) return replyErr(id, "timeout capturing screenshot");
+        if (!ok) return replyErr(id, err.empty() ? "screenshot failed" : err);
+        return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"path\":\"" + jsonEsc(val) + "\"}";
 #else
-        lucyn::layout::Box root = lucyn::layout::layoutDocument(renderDocument(), opts, stylesheet_.get());
-        lucyn::paint::DisplayList displayList = lucyn::layout::paint(root);
-        lucyn::paint::Framebuffer fb;
-        int height = static_cast<int>(root.height) > 0 ? static_cast<int>(root.height) + 20 : 600;
-        fb.init(static_cast<int>(opts.viewportWidth), height, lucyn::paint::packRGBA(255, 255, 255, 255));
-        lucyn::paint::SoftwarePainter painter(fb);
-        painter.draw(displayList);
-#endif
-
-        fs::path finalPath = uniqueDownloadPath(dir, chosen, /*overwrite=*/false);
-        if (!fb.savePNG(finalPath.u8string()))
-            return replyErr(id, "failed to write the screenshot file");
-
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-        // If a window exists (even hidden — Ghostful Mode), also present this
-        // render into it, so "window" and "screenshot" never disagree about
-        // what the page looks like.
-        if (window_) window_->present(fb);
-#endif
-
-        return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"path\":\"" +
-               jsonEsc(finalPath.generic_u8string()) + "\"}";
-    }
-#endif
-
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-#if defined(LUCYN_CONTROLLER_HAVE_PAINT)
-    void presentDocument(const lucyn::dom::Document& document) {
-        if (!window_) return;
-        lucyn::paint::Framebuffer fb;
-        fb.init(window_->width(), window_->height(), lucyn::paint::packRGBA(255, 255, 255, 255));
-#ifdef LUCYN_HAVE_LITEHTML
-        lucyn::layout::LitehtmlRenderer lhRenderer(window_->width(), window_->height());
-        lhRenderer.loadHtml(document.root().outerHTML(), "");
-        lhRenderer.render();
-        lucyn::paint::SoftwarePainter painter(fb, &lhRenderer.imageTable());
-        painter.draw(lhRenderer.displayList());
-#else
-        lucyn::layout::LayoutOptions options;
-        options.viewportWidth = static_cast<float>(window_->width());
-        options.viewportHeight = static_cast<float>(window_->height());
-        lucyn::layout::Box root = lucyn::layout::layoutDocument(document, options, stylesheet_.get());
-        lucyn::paint::DisplayList list = lucyn::layout::paint(root);
-        lucyn::paint::SoftwarePainter painter(fb);
-        painter.draw(list);
-#endif
-        window_->present(fb);
-    }
-#endif
-
-    void presentCurrentView() {
-#if defined(LUCYN_CONTROLLER_HAVE_PAINT)
-        if (!window_) return;
-        if (lastResult && lastResult->document) {
-            presentDocument(renderDocument());
-            return;
-        }
-#ifdef LUCYN_CONTROLLER_HAVE_LNM
-        if (lnmApp_ && lnmApp_->document()) presentDocument(*lnmApp_->document());
-#endif
+        (void)line;
+        return replyErr(id, "built without CEF");
 #endif
     }
-
-#if defined(LUCYN_CONTROLLER_HAVE_PAINT) && defined(LUCYN_CONTROLLER_HAVE_LNM)
-    static const lucyn::dom::Node* inputAt(const lucyn::layout::Box& box, float x, float y) {
-        for (auto it = box.children.rbegin(); it != box.children.rend(); ++it)
-            if (const auto* found = inputAt(*it, x, y)) return found;
-        if (box.node && box.node->name == "input" && x >= box.x && y >= box.y &&
-            x < box.x + box.width && y < box.y + box.height)
-            return box.node;
-        return nullptr;
-    }
-#endif
-
-    static const lucyn::dom::Node* firstInput(const lucyn::layout::Box& box) {
-        if (box.node && box.node->name == "input") return box.node;
-        for (const auto& child : box.children)
-            if (const auto* found = firstInput(child)) return found;
-        return nullptr;
-    }
-
-    // Typing with nothing focused goes to the first input, so the search box works without a prior click
-    // (a click can be eaten by window focus on some desktops). Returns true if an input got focus.
-    bool focusFirstLnmInput() {
-        if (!lnmApp_ || lastResult || !lnmApp_->document() || !window_) return false;
-        lucyn::layout::LayoutOptions opts;
-        opts.viewportWidth = static_cast<float>(window_->width());
-        opts.viewportHeight = static_cast<float>(window_->height());
-        auto root = lucyn::layout::layoutDocument(*lnmApp_->document(), opts);
-        focusedLnmInput_ = const_cast<lucyn::dom::Node*>(firstInput(root));
-        return focusedLnmInput_ != nullptr;
-    }
-
-    // Esc on a loaded page: drop the page and show the LNM home view again.
-    void goHome() {
-        if (!lnmApp_ || !lastResult) return;
-        lastResult.reset();      // before jsHost_: the page's document belongs to that run
-        jsHost_.reset();
-        lastUrl.clear();
-        focusedLnmInput_ = nullptr;
-        pushVisibilityToPage();
-        emit(eventLine("note", "returned to the LNM home view"));
-    }
-
-    void submitLnmInput() {
-#if defined(LUCYN_CONTROLLER_HAVE_LNM) && defined(LUCYN_CONTROLLER_HAVE_PAINT)
-        if (!lnmApp_ || lastResult || !focusedLnmInput_) return;
-        const std::string* type = focusedLnmInput_->attr("type");
-        const std::string* value = focusedLnmInput_->attr("value");
-        if (!type || !value || value->empty()) return;
-        const std::string inputType = *type;
-        const std::string query = *value;
-        if (inputType == "search") {
-#ifdef LUCYN_CONTROLLER_HAVE_SEARCH
-            std::string command = "{\"cmd\":\"search\",\"query\":\"" + jsonEsc(query) + "\"";
-            if (const std::string* engine = focusedLnmInput_->attr("data-engine"))
-                command += ",\"engine\":\"" + jsonEsc(*engine) + "\"";
-            command += "}";
-            std::string result = cmdSearch(0, command);
-            if (result.find("\"ok\":false") != std::string::npos)
-                emit(eventLine("note", "LNM search failed: " + jsonGetStr(result, "error")));
-            else
-                emit(eventLine("note", "LNM search loaded " + jsonGetStr(result, "url")));
-            focusedLnmInput_ = nullptr;
-#else
-            emit(eventLine("note", "LNM search needs the search module in this build"));
-#endif
-        } else if (inputType == "url") {
-            std::string url = query;
-            if (url.find("://") == std::string::npos) url = "https://" + url;
-            std::string result = cmdVisit(0, url, {});
-            if (result.find("\"ok\":false") != std::string::npos)
-                emit(eventLine("note", "LNM navigation failed: " + jsonGetStr(result, "error")));
-            else
-                emit(eventLine("note", "LNM opened " + jsonGetStr(result, "url")));
-            focusedLnmInput_ = nullptr;
-        }
-#endif
-    }
-
-    void pumpWindowEvents() {
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-        if (!window_) return;
-        bool sawQuit = false;
-        bool repaint = false;
-        for (const auto& ev : window_->pollEvents()) {
-            if (ev.type == lucyn::ui::EventType::Quit) {
-                sawQuit = true;
-            } else if (ev.type == lucyn::ui::EventType::Resize) {
-#ifdef LUCYN_CONTROLLER_HAVE_LNM
-                if (lnmApp_) lnmApp_->setViewport({static_cast<float>(ev.width), static_cast<float>(ev.height)});
-#endif
-                repaint = true;
-            }
-#if defined(LUCYN_CONTROLLER_HAVE_LNM) && defined(LUCYN_CONTROLLER_HAVE_PAINT)
-            else if (ev.type == lucyn::ui::EventType::MouseClick && lnmApp_ && !lastResult && lnmApp_->document()) {
-                lucyn::layout::LayoutOptions opts;
-                opts.viewportWidth = static_cast<float>(window_->width());
-                opts.viewportHeight = static_cast<float>(window_->height());
-                auto root = lucyn::layout::layoutDocument(*lnmApp_->document(), opts);
-                focusedLnmInput_ = const_cast<lucyn::dom::Node*>(inputAt(root, static_cast<float>(ev.clickX), static_cast<float>(ev.clickY)));
-                repaint = true;
-            } else if (ev.type == lucyn::ui::EventType::TextInput && !lastResult && lnmApp_ &&
-                       (focusedLnmInput_ || focusFirstLnmInput())) {
-                const std::string* old = focusedLnmInput_->attr("value");
-                std::string value = old ? *old : "";
-                value += ev.text;
-                focusedLnmInput_->setAttr("value", value);
-                repaint = true;
-            } else if (ev.type == lucyn::ui::EventType::KeyDown && ev.key == 27 && lnmApp_ && lastResult) {
-                goHome();
-                repaint = true;
-            } else if (ev.type == lucyn::ui::EventType::KeyDown && focusedLnmInput_ && !lastResult) {
-                const std::string* old = focusedLnmInput_->attr("value");
-                std::string value = old ? *old : "";
-                if (ev.ctrl && (ev.key == 'a' || ev.key == 'A')) {
-                    value.clear();
-                    focusedLnmInput_->setAttr("value", value);
-                    repaint = true;
-                } else if (ev.key == 8 && !value.empty()) {
-                    size_t start = value.size() - 1;
-                    while (start > 0 && (static_cast<unsigned char>(value[start]) & 0xC0) == 0x80) --start;
-                    value.erase(start);
-                    focusedLnmInput_->setAttr("value", value);
-                    repaint = true;
-                } else if (ev.key == 13 || ev.key == 1073741912 /* SDLK_KP_ENTER */) {
-                    submitLnmInput();
-                    repaint = true;
-                } else if (ev.key == 27) {
-                    focusedLnmInput_ = nullptr;
-                    repaint = true;
-                }
-            }
-#endif
-        }
-        if (sawQuit) {
-            // The user closed the window: end the whole engine, not just the window. (Before, this only hid the
-            // window and the stdin command loop kept running with nothing to show for it.)
-            quitRequested_ = true;
-            window_->setVisible(false);
-            pushVisibilityToPage();
-            emit(eventLine("note", "window closed; shutting down"));
-        }
-        if (repaint) presentCurrentView();
-#endif
-    }
-
-    bool readLineWithWindowEvents(std::string& line) {
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-        if (quitRequested_) return false;
-        if (window_ && &in == &std::cin) {
-            // The reader thread blocks in getline() and cannot be interrupted, so it must never be joined while the
-            // window can still close (that is what kept the terminal alive). State is shared and the thread detached:
-            // if the window closes first we simply stop waiting and the process exits under it.
-            struct Shared {
-                std::mutex m;
-                std::condition_variable cv;
-                bool finished = false;
-                bool ok = false;
-                std::string value;
-            };
-            auto st = std::make_shared<Shared>();
-            std::istream* src = &in;
-            std::thread([st, src] {
-                std::string v;
-                bool ok = static_cast<bool>(std::getline(*src, v));
-                {
-                    std::lock_guard<std::mutex> lock(st->m);
-                    st->value = std::move(v);
-                    st->ok = ok;
-                    st->finished = true;
-                }
-                st->cv.notify_one();
-            }).detach();
-            for (;;) {
-                pumpWindowEvents();
-                if (quitRequested_) return false;
-                std::unique_lock<std::mutex> lock(st->m);
-                if (st->cv.wait_for(lock, std::chrono::milliseconds(8), [&] { return st->finished; })) break;
-            }
-            line = std::move(st->value);
-            pumpWindowEvents();
-            return st->ok;
-        }
-#endif
-        return static_cast<bool>(std::getline(in, line));
-    }
-
-    // "Consistent lies while hidden" (README, SESSION11_PLAN.md Part D): push the real window's
-    // visible/hidden state into the live page, if one exists, via the same eval() path the
-    // "eval" command uses. Best-effort: a page script that clobbered window.__lucynSetHidden
-    // should not break window/visit commands over it.
-    void pushVisibilityToPage() {
-        if (!jsHost_) return;
-        bool hidden = !window_ || !window_->visible();
-        std::string js = std::string("window.__lucynSetHidden(") + (hidden ? "true" : "false") + ")";
-        std::string result, error;
-        jsHost_->eval(js, &result, &error);
-    }
-
-    // ---- window: show/hide/resize the (always-real) Ghostful Mode window -------------------------------------
-    std::string cmdWindow(long long id, const std::string& line) {
-        const long long w = jsonGetInt(line, "width");
-        const long long h = jsonGetInt(line, "height");
-        const int visibleFlag = jsonGetBool(line, "visible");  // -1 = not given
-
-        if (!window_) {
-            window_ = std::make_unique<lucyn::ui::Window>();
-            int cw = w > 0 ? static_cast<int>(w) : 1024;
-            int ch = h > 0 ? static_cast<int>(h) : 768;
-            bool startVisible = visibleFlag == 1;
-            if (!window_->create(cw, ch, "LucyN", startVisible)) {
-                std::string err = "failed to create the window: " + window_->lastError();
-                window_.reset();
-                return replyErr(id, err);
-            }
-        } else {
-            if (w > 0 || h > 0) {
-                int cw = w > 0 ? static_cast<int>(w) : window_->width();
-                int ch = h > 0 ? static_cast<int>(h) : window_->height();
-                bool wasVisible = window_->visible();
-                if (!window_->create(cw, ch, "LucyN", wasVisible)) {
-                    std::string err = "failed to resize the window: " + window_->lastError();
-                    return replyErr(id, err);
-                }
-            }
-            if (visibleFlag == 0) window_->setVisible(false);
-            if (visibleFlag == 1) window_->setVisible(true);
-        }
-
-        pushVisibilityToPage();
-        presentCurrentView();
-
-        return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"visible\":" +
-               (window_->visible() ? "true" : "false") +
-               ",\"width\":" + std::to_string(window_->width()) +
-               ",\"height\":" + std::to_string(window_->height()) + "}";
-    }
-#else
-    // Built without SDL2 (LUCYN_MODULE_UI off, or SDL2 not found): "window" is
-    // still a recognized command — never "unknown command: window" — it just
-    // honestly can't do anything (SESSION11_PLAN.md: "replies ok:false with a
-    // clear message if built without it").
-    std::string cmdWindow(long long id, const std::string& /*line*/) {
-        return replyErr(id, "built without SDL2 (ui module not available) — install libsdl2-dev and rebuild");
-    }
-#endif
 
     std::string cmdInfo(long long id) {
-        const auto p = sw.current();
         std::string r = "{\"id\":" + std::to_string(id) + ",\"ok\":true"
-                        ",\"profile\":\"" + jsonEsc(p.target) + "\""
                         ",\"url\":\"" + jsonEsc(lastUrl) + "\""
-                        ",\"impersonating\":" + (client.impersonating() ? "true" : "false") +
                         ",\"captures\":" + std::to_string(moonbug.total()) + "}";
         return r;
     }
@@ -1623,47 +1083,8 @@ struct Controller::Impl {
         std::string startErr = startServers(opts.moonbugRawPort, opts.nullbytePort, opts.dashboardPort, opts.dashboardFile);
         if (!startErr.empty()) emit(eventLine("note", "Moonbug: " + startErr));
 
-#ifdef LUCYN_CONTROLLER_HAVE_LNM
-        if (!opts.lnmEntry.empty()) {
-            const fs::path entry = fs::u8path(opts.lnmEntry);
-            const fs::path base = entry.parent_path();
-            lnmApp_ = std::make_unique<lucyn::lnm::App>(lucyn::lnm::diskReader(base.u8string()));
-            std::ifstream file(entry, std::ios::binary);
-            std::ostringstream source;
-            if (!file) {
-                emit(eventLine("note", "LNM entry could not be read: " + entry.u8string()));
-                lnmApp_.reset();
-            } else {
-                source << file.rdbuf();
-                if (!lnmApp_->load(source.str())) {
-                    for (const auto& d : lnmApp_->diagnostics())
-                        emit(eventLine("note", "LNM: " + d.message));
-                    lnmApp_.reset();
-                }
-            }
-        }
-#elif !defined(LUCYN_CONTROLLER_HAVE_LNM)
-        if (!opts.lnmEntry.empty()) emit(eventLine("note", "LNM entry configured but this build has no LNM module"));
-#endif
-
-        if (opts.showWindow || opts.ghostfulWindow
-#ifdef LUCYN_CONTROLLER_HAVE_LNM
-            || lnmApp_
-#endif
-        ) {
-#ifdef LUCYN_CONTROLLER_HAVE_UI
-            window_ = std::make_unique<lucyn::ui::Window>();
-            bool startVisible = opts.showWindow;  // ghostfulWindow alone: created, but hidden
-            if (!window_->create(1024, 768, "LucyN", startVisible)) {
-                emit(eventLine("note", "window creation at startup failed: " + window_->lastError()));
-                window_.reset();
-            } else presentCurrentView();
-#else
-            emit(eventLine("note", "showWindow/ghostfulWindow was requested but this build has no ui module (SDL2 not found) — staying headless"));
-#endif
-        }
         std::string line;
-        while (readLineWithWindowEvents(line)) {
+        while (std::getline(in, line)) {
             // Strip trailing CR (Windows line endings).
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
@@ -1680,10 +1101,9 @@ struct Controller::Impl {
                 if (id >= 0) reply(replyOk(id));
                 return 0;
             } else if (cmd == "visit") {
-                std::string url     = jsonGetStr(line, "url");
-                std::string profile = jsonGetStr(line, "profile");
+                std::string url = jsonGetStr(line, "url");
                 if (url.empty()) { reply(replyErr(id, "'url' required")); continue; }
-                reply(cmdVisit(id, url, profile));
+                reply(cmdVisit(id, url));
 #ifdef LUCYN_CONTROLLER_HAVE_SEARCH
             } else if (cmd == "search") {
                 reply(cmdSearch(id, line));
@@ -1711,25 +1131,41 @@ struct Controller::Impl {
                 std::string sel = jsonGetStr(line, "selector");
                 if (sel.empty()) { reply(replyErr(id, "'selector' required")); continue; }
                 reply(cmdClick(id, sel));
-            } else if (cmd == "profile") {
-                std::string name = jsonGetStr(line, "name");
-                if (name.empty()) { reply(replyErr(id, "'name' required")); continue; }
-                reply(cmdProfile(id, name));
+            } else if (cmd == "fill") {
+                std::string sel = jsonGetStr(line, "selector");
+                if (sel.empty()) { reply(replyErr(id, "'selector' required")); continue; }
+                reply(cmdFill(id, sel, jsonGetStr(line, "value")));
+            } else if (cmd == "submit") {
+                std::string sel = jsonGetStr(line, "selector");
+                if (sel.empty()) { reply(replyErr(id, "'selector' required")); continue; }
+                reply(cmdSubmit(id, sel));
             } else if (cmd == "cookies") {
                 reply(cmdCookies(id, jsonGetStr(line, "url")));
             } else if (cmd == "setCookie") {
                 reply(cmdSetCookie(id, line));
             } else if (cmd == "clearCookies") {
-                client.clearCookies();
-                reply(replyOk(id));
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+                if (cef_) {
+                    // CEF path: delete every cookie in Chromium's store.
+                    bool done = false, ok = false;
+                    std::string err2;
+                    cef_->clearCookies([&](bool o, const std::string&, const std::string& e) {
+                        done = true; ok = o; err2 = e;
+                    });
+                    if (!cefWait([&] { return done; }, 15000)) reply(replyErr(id, "timeout clearing cookies"));
+                    else if (!ok) reply(replyErr(id, err2.empty() ? "cannot clear cookies" : err2));
+                    else reply(replyOk(id));
+                    continue;
+                }
+                reply(replyErr(id, "no browser instance (CEF not initialised)"));
+#else
+                reply(replyErr(id, "built without CEF"));
+#endif
+                continue;
             } else if (cmd == "download") {
                 reply(cmdDownload(id, line));
-#ifdef LUCYN_CONTROLLER_HAVE_PAINT
             } else if (cmd == "screenshot") {
                 reply(cmdScreenshot(id, line));
-#endif
-            } else if (cmd == "window") {
-                reply(cmdWindow(id, line));
             } else if (cmd == "info") {
                 reply(cmdInfo(id));
             } else if (cmd == "moonbug") {

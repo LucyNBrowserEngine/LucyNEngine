@@ -21,9 +21,9 @@ ctest --test-dir build --output-on-failure
 For focused work, build a module independently where supported, for example:
 
 ```sh
-cmake -S modules/dom -B build-dom
-cmake --build build-dom -j
-ctest --test-dir build-dom --output-on-failure
+cmake -S modules/profile -B build-profile
+cmake --build build-profile -j
+ctest --test-dir build-profile --output-on-failure
 ```
 
 Add tests with the owning module and follow its existing `test_<area>.cpp` and CTest conventions. If you do not run a relevant test or build, say so and explain why. Do not claim a build proves runtime behavior; include integration evidence for changes that cross module boundaries.

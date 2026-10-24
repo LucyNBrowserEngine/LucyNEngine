@@ -8,17 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT TARGET lucyn::core)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../core    ${CMAKE_CURRENT_BINARY_DIR}/core)
 endif()
-if(NOT TARGET lucyn::profile)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../profile ${CMAKE_CURRENT_BINARY_DIR}/profile)
-endif()
 if(NOT TARGET lucyn::net)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../net     ${CMAKE_CURRENT_BINARY_DIR}/net)
-endif()
-if(NOT TARGET lucyn::dom)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../dom     ${CMAKE_CURRENT_BINARY_DIR}/dom)
-endif()
-if(NOT TARGET lucyn::shell)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shell   ${CMAKE_CURRENT_BINARY_DIR}/shell)
 endif()
 if(NOT TARGET lucyn::security)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../security ${CMAKE_CURRENT_BINARY_DIR}/security)
@@ -29,8 +20,8 @@ endif()
 if(NOT TARGET lucyn::adblock)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../adblock ${CMAKE_CURRENT_BINARY_DIR}/adblock)
 endif()
-if(NOT TARGET lucyn::js)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../js      ${CMAKE_CURRENT_BINARY_DIR}/js)
+if(NOT TARGET lucyn::logger)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../logger ${CMAKE_CURRENT_BINARY_DIR}/logger)
 endif()
 if(NOT TARGET lucyn::search AND (NOT DEFINED LUCYN_MODULE_SEARCH OR LUCYN_MODULE_SEARCH))
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../search  ${CMAKE_CURRENT_BINARY_DIR}/search)
@@ -50,17 +41,24 @@ target_compile_options(lucyn_controller PRIVATE -Wall -Wextra)
 target_link_libraries(lucyn_controller
     PUBLIC
         lucyn::core
-        lucyn::profile
         lucyn::net
-        lucyn::shell
-        lucyn::js
         lucyn::security
         lucyn::server
         lucyn::adblock
+    PRIVATE
+        lucyn::logger
 )
 if(TARGET lucyn::search)
   target_link_libraries(lucyn_controller PRIVATE lucyn::search)
   target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_SEARCH=1)
+endif()
+
+# Session 19 steps 5-6: Chromium-backed visit/html/eval/extract/extractAll/click
+# via cef_host. Only when CEF is on (the root adds cef_host before this module);
+# otherwise — or in a standalone build — those six commands keep the old path.
+if(TARGET lucyn::cef_host)
+  target_link_libraries(lucyn_controller PRIVATE lucyn::cef_host)
+  target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_CEF=1)
 endif()
 
 # ---- tests ------------------------------------------------------------------
@@ -70,13 +68,4 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR LUCYN_BUILD_TESTS)
   target_compile_options(test_controller PRIVATE -Wall -Wextra)
   enable_testing()
   add_test(NAME controller COMMAND test_controller)
-  add_executable(test_controller_net tests/test_controller_net.cpp)
-  target_link_libraries(test_controller_net PRIVATE lucyn::controller)
-  target_include_directories(test_controller_net PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../net/tests)
-  add_test(NAME controller_net COMMAND test_controller_net)
-  add_executable(test_controller_download tests/test_controller_download.cpp)
-  target_link_libraries(test_controller_download PRIVATE lucyn::controller)
-  target_compile_options(test_controller_download PRIVATE -Wall -Wextra)
-  target_include_directories(test_controller_download PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../net/tests)
-  add_test(NAME controller_download COMMAND test_controller_download)
 endif()

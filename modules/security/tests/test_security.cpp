@@ -111,6 +111,10 @@ static void test_envelope() {
     CHECK(o3.ok && o3.payload == uni);
     // wrong algorithm is refused, not "verified anyway"
     CHECK(!nb.open("{\"alg\":\"MD5\",\"sig\":\"" + sig + "\",\"payload\":\"abc\"}").ok);
+    // a future envelope version is refused with a clear error (v:1 is the only known version)
+    auto ov = nb.open("{\"v\":2,\"sig\":\"" + sig + "\",\"payload\":\"abc\"}");
+    CHECK(!ov.ok && ov.error == "unsupported envelope version");
+    // ...and a legacy envelope with no `v` at all still verifies (checked in the re-serialised case above)
     // garbage never crashes and never verifies
     for (const char* bad : {"", "{", "[]", "{\"sig\":1,\"payload\":2}", "{\"sig\":\"00\"}", "{\"payload\":\"abc\"}",
                             "{\"sig\":\"x\",\"payload\":\"\\ud83d\"}", "{\"sig\":\"x\",\"payload\":\"abc", "null"}) {
@@ -125,7 +129,8 @@ static void test_key_file() {
     namespace fs = std::filesystem;
     fs::path dir = fs::temp_directory_path() / ("lucyn_nb_test_" + std::to_string(std::rand()));
     fs::create_directories(dir);
-    std::string path = (dir / "sub" / "nullbyte.key").string();
+    lucyn::core::setDataRootForTests((dir / "data").string());   // set BEFORE creating: new keys must live under it
+    std::string path = (dir / "data" / "sub" / "nullbyte.key").string();
 
     std::string err;
     std::string k1 = Nullbyte::loadOrCreateKey(path, &err);
@@ -142,8 +147,14 @@ static void test_key_file() {
     std::ifstream f(path); std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     CHECK(content == "this is not hex\n");                        // ... and NOT silently replaced
 
-    lucyn::core::setDataRootForTests(dir.string());
-    CHECK(Nullbyte::defaultKeyPath() == (dir / "security" / "nullbyte.key").string());
+    // creating a NEW key OUTSIDE the data directory is refused (defence in depth), and nothing is written
+    std::string outside = (dir / "outside.key").string();
+    std::string e2;
+    CHECK(Nullbyte::loadOrCreateKey(outside, &e2).empty());
+    CHECK(!e2.empty());
+    CHECK(!fs::exists(outside));
+
+    CHECK(Nullbyte::defaultKeyPath() == (dir / "data" / "security" / "nullbyte.key").string());
     lucyn::core::setDataRootForTests("");
     std::error_code ec; fs::remove_all(dir, ec);
     std::puts("PASS: key_file");

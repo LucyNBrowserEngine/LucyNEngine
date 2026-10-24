@@ -1,29 +1,28 @@
 #include <lucyn/search/search.h>
 
 #include <iostream>
-#include <sstream>
+#include <string>
+#include <vector>
 
 int main(int argc, char** argv) {
     lucyn::search::Registry providers;
-    if (argc == 2 && std::string(argv[1]) == "list") {
-        for (const auto& engine : providers.engines())
-            std::cout << engine.id << "\t" << engine.name << (engine.queryTemplate.empty() ? "\t(configure instance)" : "") << '\n';
-        return 0;
-    }
-    if (argc < 3) {
-        std::cerr << "usage: lucyn-search list | <engine> <query> [--searxng <instance-url>]\n";
-        return 2;
+
+    // Split args into positionals and option pairs, so --config/--searxng can appear anywhere.
+    std::vector<std::string> positional;
+    std::string configPath, instance;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--config" && i + 1 < argc)       configPath = argv[++i];
+        else if (a == "--searxng" && i + 1 < argc) instance = argv[++i];
+        else                                       positional.push_back(a);
     }
 
-    const std::string id = argv[1];
-    std::string query;
-    std::string instance;
-    for (int i = 2; i < argc; ++i) {
-        if (std::string(argv[i]) == "--searxng" && i + 1 < argc) {
-            instance = argv[++i];
-        } else {
-            if (!query.empty()) query += ' ';
-            query += argv[i];
+    // A JSON config file can override any engine (and the default) before we build a URL.
+    if (!configPath.empty()) {
+        std::string err;
+        if (!providers.loadFromFile(configPath, &err)) {
+            std::cerr << "config: " << err << '\n';
+            return 1;
         }
     }
     if (!instance.empty()) {
@@ -32,6 +31,24 @@ int main(int argc, char** argv) {
             providers.add({"searxng", "SearXNG", instance + "?q={query}"});
         else
             providers.add({"searxng", "SearXNG", instance + "/search?q={query}"});
+    }
+
+    if (positional.empty() || positional[0] == "list") {
+        for (const auto& engine : providers.engines()) {
+            std::cout << engine.id << "\t" << engine.name;
+            if (!engine.keyword.empty()) std::cout << "\tkeyword:" << engine.keyword;
+            if (engine.queryTemplate.empty()) std::cout << "\t(configure instance)";
+            if (engine.id == providers.defaultId()) std::cout << "\t(default)";
+            std::cout << '\n';
+        }
+        return 0;
+    }
+
+    const std::string id = positional[0];
+    std::string query;
+    for (size_t i = 1; i < positional.size(); ++i) {
+        if (!query.empty()) query += ' ';
+        query += positional[i];
     }
     std::string error;
     auto url = providers.url(id, query, &error);

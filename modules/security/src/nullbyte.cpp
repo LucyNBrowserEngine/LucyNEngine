@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <random>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -16,6 +15,8 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <bcrypt.h>
+#elif defined(__linux__)
+#  include <sys/random.h>   // getrandom(2)
 #endif
 
 namespace lucyn::security {
@@ -310,7 +311,17 @@ Nullbyte::Opened Nullbyte::open(std::string_view json) const {
             if (!readString(c, &key) || !c.eat(':')) { r.error = "malformed envelope"; return r; }
             c.ws();
             const bool isStr = c.i < c.s.size() && c.s[c.i] == '"';
-            if (isStr && (key == "sig" || key == "payload" || key == "alg")) {
+            if (key == "v") {                              // version: only v:1 is understood (number or string)
+                std::string ver;
+                if (isStr) {
+                    if (!readString(c, &ver)) { r.error = "malformed envelope"; return r; }
+                } else {
+                    std::size_t st = c.i;
+                    while (c.i < c.s.size() && std::string_view(",}] \t\r\n").find(c.s[c.i]) == std::string_view::npos) ++c.i;
+                    ver.assign(c.s.substr(st, c.i - st));
+                }
+                if (ver != "1") { r.error = "unsupported envelope version"; return r; }
+            } else if (isStr && (key == "sig" || key == "payload" || key == "alg")) {
                 std::string v;
                 if (!readString(c, &v)) { r.error = "malformed string in envelope"; return r; }
                 if (key == "sig") { sig = std::move(v); haveSig = true; }
@@ -323,7 +334,7 @@ Nullbyte::Opened Nullbyte::open(std::string_view json) const {
         }
     }
     if (!haveSig || !havePayload) { r.error = "envelope needs \"sig\" and \"payload\" strings"; return r; }
-    if (!alg.empty() && alg != kAlgorithm) { r.error = "unsupported algorithm: " + alg; return r; }
+    if (!alg.empty() && alg != kAlgorithm) { r.error = "unsupported algorithm"; return r; }
     r.parsed = true;
     r.payload = std::move(payload);
     r.ok = verify(r.payload, sig);
@@ -335,21 +346,45 @@ std::string Nullbyte::defaultKeyPath() {
     return core::dataDir("security") + "/nullbyte.key";
 }
 
+namespace {
+
+// Defence in depth: a NEW key file may only be created under the data directory. Reading an existing
+// file is safe (non-hex content fails to parse), so this guards only the create path — an attacker who
+// controls `path` cannot drop a file somewhere sensitive (e.g. /etc/cron.d) when running privileged.
+bool underDataRoot(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path root = fs::weakly_canonical(fs::path(core::dataRoot()), ec);
+    if (ec || root.empty()) return true;                       // root unknown: leave the decision to the caller
+    fs::path canon = fs::weakly_canonical(fs::path(path), ec);
+    if (ec) return false;
+    std::string r = root.string(), c = canon.string();
+    if (c == r) return true;
+    if (!r.empty() && r.back() != '/') r += '/';
+    return c.rfind(r, 0) == 0;
+}
+
+}  // namespace
+
 std::string Nullbyte::generateKey() {
     std::string k(32, '\0');
 #ifdef _WIN32
     if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&k[0]), ULONG(k.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
         return k;
 #else
+#  ifdef __linux__
+    // getrandom(2): no file descriptor (cannot be exhausted, works before /dev is mounted). Preferred over /dev/urandom.
+    if (getrandom(&k[0], k.size(), 0) == (ssize_t)k.size()) return k;
+#  endif
     if (std::FILE* f = std::fopen("/dev/urandom", "rb")) {
         std::size_t got = std::fread(&k[0], 1, k.size(), f);
         std::fclose(f);
         if (got == k.size()) return k;
     }
 #endif
-    std::random_device rd;   // last resort; on mainstream libstdc++/libc++/MSVC this is also OS entropy
-    for (auto& ch : k) ch = char(rd() & 0xFF);
-    return k;
+    // Fail closed. A predictable HMAC key is worse than no key, and std::random_device is NOT guaranteed
+    // cryptographic (it is deterministic on some toolchains, e.g. older MinGW), so never fall back to it.
+    throw std::runtime_error("NULLBYTE: no OS entropy source available for key generation");
 }
 
 std::string Nullbyte::loadOrCreateKey(const std::string& path, std::string* err) {
@@ -367,6 +402,11 @@ std::string Nullbyte::loadOrCreateKey(const std::string& path, std::string* err)
             return {};
         }
         return raw;
+    }
+    // Creating a NEW key file: only under the data directory (see underDataRoot).
+    if (!underDataRoot(path)) {
+        if (err) *err = "NULLBYTE key path must be under the data directory: " + path;
+        return {};
     }
     std::string key = generateKey();
     fs::create_directories(fs::path(path).parent_path(), ec);

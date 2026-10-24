@@ -1,7 +1,0 @@
-litehtml — https://github.com/litehtml/litehtml
-License: BSD-3-Clause (see include/litehtml/LICENSE or the GitHub repo)
-Vendored into LucyN for SESSION17+ CSS colour/image/gradient rendering.
-
-Bundled gumbo-parser (src/gumbo/):
-  https://github.com/google/gumbo-parser
-  License: Apache-2.0

@@ -21,6 +21,9 @@ nothing-data/
 
 # Local third-party binary bundle; keep its upstream notices if distributing it
 /third_party/curl-impersonate/
+/third_party/cef
+
+
 
 # Node.js local dependencies and logs
 /client/node_modules/

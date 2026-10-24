@@ -28,7 +28,6 @@ Label labelFor(Level level) {
         case Level::error:   return {"ERROR", "❌", "\033[31m", Threshold::error};
         case Level::fatal:   return {"FATAL", "💀", "\033[91m", Threshold::fatal};
         case Level::build:   return {"BUILD", "🔧", "\033[34m", Threshold::info};
-        case Level::lnm:     return {"LNM", "🧩", "\033[35m", Threshold::info};
     }
     return {"INFO", "ℹ️", "\033[36m", Threshold::info};
 }

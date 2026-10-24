@@ -22,14 +22,11 @@ The client looks for the `lucyn` binary in this order:
 import Lucyn from "nothing-browser";
 
 const a = new Lucyn({
-  profile: "chrome",          // browser identity (default: "chrome" -> chrome146)
   settleTimeoutMs: 5000,      // JS idle timeout per visit
   console: false,             // echo page console.* to stderr
   adblock: true,               // built-in request filtering (default: true)
   adblockList: "./filters.txt", // optional additional EasyList/uBO rules
-  config: "./engine.json",     // optional engine config (search defaults and LNM entry)
-  show: true,                   // open the SDL window visibly at startup
-  ghostful: false,            // create a real (hidden) SDL window at startup; see README.md's Ghostful Mode (Session 11)
+  config: "./engine.json",     // optional engine config (search defaults)
 });
 
 // Navigate
@@ -45,11 +42,8 @@ const heading = await a.extract("h1");          // first match, text content
 const links   = await a.extractAll("a");        // all matches
 const html    = await a.html();                  // full settled HTML
 
-// Switch identity
-await a.profile("safari184");
-
 // Engine info
-const { profile, impersonating } = await a.info();
+const { url, captures } = await a.info();
 
 // Events (page errors, notes, future Moonbug captures)
 a.on("pageError", (e) => console.error("page error:", e.message));
@@ -63,7 +57,7 @@ await a.close();
 
 | Command | Args | Returns |
 |---|---|---|
-| `visit(url, [opts])` | `url`, optional `opts.profile` | `{status, url, title}` |
+| `visit(url)` | `url` | `{status, url, title}` |
 | `open(url, [opts])` | same as `visit` | direct website navigation |
 | `search(query, [opts])` | optional `opts.engine` (defaults to `search.default`) | loads provider results page; built-ins: Brave, SearXNG, Google, DuckDuckGo, Bing, Ecosia, Startpage, Mojeek, Qwant, Swisscows |
 | `html()` | none | settled HTML string |
@@ -77,11 +71,8 @@ await a.close();
 | `setCookie(cookie)` | `{name, value, domain \| url, path?, secure?, httpOnly?, expires?}` | restore a session (M7) |
 | `clearCookies()` | none | empties the jar (M7) |
 | `download(url, [opts])` | `url` (http/https), `opts.name`, `opts.overwrite`, `opts.maxBytes`, `opts.referer` | `{path, name, bytes, status, type, url}`: saved into `nothing-data/downloads/`; rejects on a non-2xx / error and leaves no file (M9 addendum) |
-| `screenshot([name], [opts])` | optional file name, `opts.width` | absolute path of the saved PNG in `nothing-data/screenshots/`; renders offscreen (layout + SoftwarePainter), no SDL/display needed (Session 11) |
-| `setWindow([opts])` | `opts.visible`, `opts.width`, `opts.height` | `{visible, width, height}`; rejects with a clear message if the engine was built without SDL2 (Session 11) |
-| `setVisible(visible)` | boolean | convenience for `setWindow({visible})` — matches the `engine.setVisible(false)` examples above (Session 11) |
-| `profile(name)` | profile target | resolved profile name |
-| `info()` | none | `{profile, url, impersonating}` |
+| `screenshot([name], [opts])` | optional file name, `opts.width` | absolute path of the saved PNG in `nothing-data/screenshots/`; rendered offscreen by Chromium — the engine never opens a window |
+| `info()` | none | `{url, captures}` |
 | `close()` | none | none |
 
 `visit()` returns once the page's own scripts and timers have run; a `fetch()`/XHR the page started on load may

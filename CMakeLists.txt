@@ -1,8 +1,10 @@
 # LucyN root: it only wires modules together. Each module lives in modules/<name>/,
 # has its own CMakeLists.txt, and also builds standalone:
-#     cmake -S modules/profile -B build-profile
+#     cmake -S modules/net -B build-net
 cmake_minimum_required(VERSION 3.16)
-project(LucyN VERSION 0.1.0 LANGUAGES CXX)
+# C is enabled because CEF's cmake machinery (cef_variables.cmake) runs
+# CHECK_C_COMPILER_FLAG probes when it is included.
+project(LucyN VERSION 0.1.0 LANGUAGES C CXX)
 
 option(LUCYN_BUILD_TESTS "Build module tests" ON)
 option(LUCYN_BUILD_TOOLS "Build module command-line tools" ON)
@@ -10,19 +12,10 @@ option(LUCYN_BUILD_TOOLS "Build module command-line tools" ON)
 # One switch per module. Turn off what you don't need (e.g. no libcurl on this box).
 option(LUCYN_MODULE_CORE    "Core module (nothing-data paths)"      ON)
 option(LUCYN_MODULE_LOGGER "Logger module (engine diagnostics)" ON)
-option(LUCYN_MODULE_PROFILE "Profile module (identity + switching)" ON)
-option(LUCYN_MODULE_NET     "Network module (libcurl wrapper)"      ON)
-option(LUCYN_MODULE_DOM     "DOM module (HTML -> tree, needs libgumbo-dev)" ON)
-option(LUCYN_MODULE_SHELL   "Shell module (open a site inside the shell, inject scripts, snapshots)" ON)
+option(LUCYN_MODULE_NET     "Network module (Moonbug capture wiretap; Chromium/CEF is the HTTP stack now)" ON)
 option(LUCYN_MODULE_SECURITY "Security module (NULLBYTE: HMAC-SHA256 seal for captured traffic)" ON)
 option(LUCYN_MODULE_SERVER   "Server module (TinyElysia on vendored Mongoose + Moonbug capture dashboard)" ON)
-option(LUCYN_MODULE_JS      "JS module (QuickJS + DOM bridge: the real script host for the shell)" ON)
-option(LUCYN_MODULE_PAINT   "Paint module (display list + SoftwarePainter; stb_truetype/stb_image, no SDL)" ON)
-option(LUCYN_MODULE_LAYOUT  "Layout module (block/inline box tree -> display list; needs dom + paint)" ON)
-option(LUCYN_MODULE_LNM     "LNM interpreter (lnminterpreter/: parser + styled-DOM compiler + view switching; needs dom + paint + layout)" ON)
 option(LUCYN_MODULE_SEARCH  "Search provider registry (free web search URL templates)" ON)
-option(LUCYN_MODULE_UI      "UI module (SDL2 window + Ghostful Mode; builds only if SDL2 is found)" ON)
-option(LUCYN_LITEHTML       "Vendor litehtml for full CSS colour/image rendering (SESSION17+)" ON)
 
 # All tools land in build/bin, so they share ONE nothing-data folder (build/bin/nothing-data).
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
@@ -31,16 +24,19 @@ endif()
 
 enable_testing()
 
-# Vendor litehtml + bundled gumbo FIRST — dom module falls back to lucyn::gumbo
-# if libgumbo-dev is not installed on the host.
-if(LUCYN_LITEHTML AND LUCYN_MODULE_LAYOUT AND LUCYN_MODULE_DOM AND LUCYN_MODULE_PAINT)
-  if(NOT TARGET litehtml)
-    add_subdirectory(third_party/litehtml)
-  endif()
+# Session 19: CEF is the new engine (Chromium does the HTTP, JS, DOM and rendering).
+# The binary distribution is unpacked at third_party/cef/; cmake/FindCEF.cmake
+# loads the distro's own CMake machinery, builds libcef_dll_wrapper and defines
+# the lucyn::cef interface target. Nothing consumes CEF yet beyond linking it
+# into the lucyn binary (main.cpp's CefExecuteProcess subprocess check); no old
+# module is removed until the CEF build is green.
+option(LUCYN_WITH_CEF "Link the CEF engine (Chromium Embedded Framework) into the lucyn binary" ON)
+if(LUCYN_WITH_CEF)
+  include(cmake/FindCEF.cmake)
 endif()
 
 if(LUCYN_MODULE_CORE)
-  add_subdirectory(modules/core)       # first: profile and shell use it
+  add_subdirectory(modules/core)       # first: everything else uses it
 endif()
 
 if(LUCYN_MODULE_SEARCH)
@@ -52,14 +48,11 @@ if(LUCYN_MODULE_LOGGER)
 endif()
 add_subdirectory(modules/adblock)
 
-if(LUCYN_MODULE_PROFILE)
-  add_subdirectory(modules/profile)
-endif()
 if(LUCYN_MODULE_SECURITY AND LUCYN_MODULE_CORE)
   add_subdirectory(modules/security)  # NULLBYTE; only needs core
 endif()
 if(LUCYN_MODULE_NET)
-  add_subdirectory(modules/net)       # needs profile; pulls it in itself if you switched it off
+  add_subdirectory(modules/net)       # Moonbug only (self-contained, no deps)
 endif()
 
 # M5: TinyElysia + capture dashboard. Needs net (Moonbug) and security (NULLBYTE); Mongoose is vendored (GPL-2.0 or commercial).
@@ -67,83 +60,63 @@ if(LUCYN_MODULE_SERVER AND LUCYN_MODULE_NET AND LUCYN_MODULE_SECURITY)
   add_subdirectory(modules/server)
 endif()
 
-if(LUCYN_MODULE_DOM)
-  add_subdirectory(modules/dom)       # after net, so lucyn-dom gets --url when net is on
-endif()
-
-if(LUCYN_MODULE_SHELL AND LUCYN_MODULE_DOM)
-  add_subdirectory(modules/shell)     # after dom (needs it) and net (lucyn-shell gets URL fetching when net is on)
-endif()
-
-if(LUCYN_MODULE_JS AND LUCYN_MODULE_SHELL AND LUCYN_MODULE_PROFILE)
-  add_subdirectory(modules/js)        # after shell (implements its ScriptHost) and profile (navigator/screen come from the persona)
-  # js depends on shell, so shell cannot link js itself: the real host is plugged into lucyn-shell here, at the root.
-  if(TARGET lucyn-shell)
-    target_link_libraries(lucyn-shell PRIVATE lucyn::js)
-    target_compile_definitions(lucyn-shell PRIVATE LUCYN_SHELL_HAVE_JS=1)
-  endif()
-endif()
-
-# M6: paint (display list + SoftwarePainter, no SDL) -> layout (box tree, needs
-# dom + paint) -> ui (SDL2 window + Ghostful Mode, needs paint; optional: builds
-# only if SDL2 is found). Session 11, see SESSION11.md.
-if(LUCYN_MODULE_PAINT)
-  add_subdirectory(modules/paint)
-endif()
-if(LUCYN_MODULE_LAYOUT AND LUCYN_MODULE_DOM AND LUCYN_MODULE_PAINT)
-  add_subdirectory(modules/layout)
-  # paint's CMakeLists.txt runs before lucyn::layout exists, so it cannot wire
-  # lucyn-paint's --file flag itself (same reason js is wired into lucyn-shell
-  # below, not inside shell's own CMakeLists.txt). Done here instead, now that
-  # both targets exist. modules/layout/CMakeLists.txt does the same thing for
-  # its own standalone build.
-  if(TARGET lucyn-paint AND TARGET lucyn::dom)
-    target_link_libraries(lucyn-paint PRIVATE lucyn::dom lucyn::layout)
-    target_compile_definitions(lucyn-paint PRIVATE LUCYN_PAINT_HAVE_LAYOUT_DOM=1)
-  endif()
-endif()
-# Session 12: LNM. Lives in lnminterpreter/ (next to modules/, the author's choice); it is shaped like a module
-# (include/lucyn/lnm, src, tools, tests, standalone CMakeLists) so moving it to modules/lnm/ is a rename.
-if(LUCYN_MODULE_LNM AND TARGET lucyn::layout)
-  add_subdirectory(lnminterpreter)
-endif()
-if(LUCYN_MODULE_UI AND LUCYN_MODULE_PAINT)
-  add_subdirectory(modules/ui)   # silently skips itself (message + return()) if SDL2 is missing
+# Session 19: the old engine modules (dom, shell, js, layout, paint) are gone — CEF is the
+# engine now (see engine-history/SESSION19_CEF_MIGRATION.md "What DIES").
+# Session 19 steps 2-4: the CEF host module (initCef / shutdownCef / createInstance).
+# Needs lucyn::cef (from cmake/FindCEF.cmake, included near the top) and lucyn::core
+# (added near the top). Guarded by both switches; the module's own CMakeLists is a
+# no-op if LUCYN_WITH_CEF is OFF. lucyn_cef_copy_runtime() is called here too so the
+# module's smoke tool + ctest find libcef.so/icudtl.dat without depending on the app.
+option(LUCYN_MODULE_CEF_HOST "CEF host module (initCef/createInstance over CEF)" ON)
+if(LUCYN_MODULE_CEF_HOST AND LUCYN_WITH_CEF)
+  add_subdirectory(modules/cef_host)
+  lucyn_cef_copy_runtime()
 endif()
 
 # M4: controller module (JSON command loop) + lucyn app binary (the front door).
 option(LUCYN_MODULE_CONTROLLER "Controller module (M4 JSON command loop over stdio)" ON)
 if(LUCYN_MODULE_CONTROLLER
    AND LUCYN_MODULE_CORE
-   AND LUCYN_MODULE_PROFILE
    AND LUCYN_MODULE_NET
-   AND LUCYN_MODULE_DOM
-   AND LUCYN_MODULE_SHELL
-   AND LUCYN_MODULE_JS
    AND LUCYN_MODULE_SECURITY
    AND LUCYN_MODULE_SERVER)
   add_subdirectory(modules/controller)
   add_subdirectory(apps/lucyn)
 
-  # screenshot (needs dom + layout + paint) and window (needs ui) are wired
-  # into the controller library here, same "both targets must already exist"
-  # reason as the js-into-shell wiring above (controller.cpp is compiled
-  # inside the lucyn_controller static library, not the lucyn executable, so
-  # that's the target that needs the link + the define). Each is
-  # independently optional: a controller built without LUCYN_MODULE_LAYOUT/
-  # PAINT simply doesn't get "screenshot"; without ui, "window" still exists
-  # as a command but replies ok:false with a clear message (see
-  # modules/controller/src/controller.cpp).
-  if(TARGET lucyn_controller AND TARGET lucyn::layout AND TARGET lucyn::paint)
-    target_link_libraries(lucyn_controller PRIVATE lucyn::layout lucyn::paint)
-    target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_PAINT=1)
-  endif()
-  if(TARGET lucyn_controller AND TARGET lucyn::ui)
-    target_link_libraries(lucyn_controller PRIVATE lucyn::ui)
-    target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_UI=1)
-  endif()
-  if(TARGET lucyn_controller AND TARGET lucyn::lnm)
-    target_link_libraries(lucyn_controller PRIVATE lucyn::lnm)
-    target_compile_definitions(lucyn_controller PRIVATE LUCYN_CONTROLLER_HAVE_LNM=1)
+  # Session 19: CEF is the engine — the controller's screenshot (and every other
+  # engine command) runs through Chromium, so the old layout/paint wiring is gone.
+
+  # Session 19 step 1: CEF is linked into the lucyn binary (root wires it, same
+  # "both targets must exist" rule as the surviving module wiring above). CEF 156
+  # headers require C++20, so the app target bumps its standard; the static
+  # modules stay on their own C++17. lucyn_cef_copy_runtime() drops libcef.so,
+  # icudtl.dat, *.pak and locales/ next to bin/ — CEF looks for them next to
+  # the executable at startup.
+  if(LUCYN_WITH_CEF AND TARGET lucyn AND TARGET lucyn::cef)
+    # lucyn::cef_host too: main.cpp calls executeCefProcess/initCef/shutdownCef
+    # and the Controller drives a BrowserInstance (Session 19 steps 5-6).
+    target_link_libraries(lucyn PRIVATE lucyn::cef lucyn::cef_host)
+    set_target_properties(lucyn PROPERTIES CXX_STANDARD 20)
+    # Deterministic rpath, $ORIGIN FIRST:
+    #   $ORIGIN (= build/bin)  -> where lucyn_cef_copy_runtime put libcef.so +
+    #                             icudtl.dat/*.pak/locales, so CEF resolves its
+    #                             runtime files next to the binary (it looks beside
+    #                             wherever libcef.so loaded from). For a normal
+    #                             run from build/bin this always wins -> ICU works.
+    #   build/bin (fallback)   -> the COMPLETE runtime (libcef.so + icudtl.dat side
+    #                             by side), used when the binary is copied elsewhere
+    #                             (the cli_download test copies lucyn into a temp
+    #                             dir). ICU data must sit next to the loaded
+    #                             libcef.so, so pointing here instead of cef/Release
+    #                             keeps a relocated binary from dying with the
+    #                             cryptic "Invalid file descriptor to ICU data".
+    #   cef/Release (last)     -> lets the binary at least LOAD if build/bin itself
+    #                             is gone.
+    # Set explicitly so we never depend on link order; for a build/bin run $ORIGIN
+    # always wins over both fallbacks.
+    set_target_properties(lucyn PROPERTIES
+      INSTALL_RPATH "$ORIGIN;${CMAKE_RUNTIME_OUTPUT_DIRECTORY};${CEF_BINARY_DIR_RELEASE}"
+      BUILD_WITH_INSTALL_RPATH TRUE)
+    lucyn_cef_copy_runtime()
   endif()
 endif()

@@ -5,7 +5,7 @@
 
 ## Overview
 
-The Lucy N. engine exposes a C++ configuration API that controls everything the engine needs to know **before the UI loads**. All visual customization, page design, and user-facing settings live in HTML/LNM files — not here.
+The Lucy N. engine exposes a C++ configuration API that controls everything the engine needs to know **before a page loads**. LucyN is headless: it has no window and no chrome. Page-facing behavior lives in the visited site itself; engine-facing behavior lives here.
 
 ---
 
@@ -21,7 +21,7 @@ engine.config.motto      = "Truth over rendering."
 
 | Field | Type | Description |
 |---|---|---|
-| `name` | string | App name shown in taskbar / window title |
+| `name` | string | Engine/app display name |
 | `iconpath` | string | Path to icon image |
 | `motto` | string | Tagline — queryable in homepage.html |
 
@@ -44,25 +44,12 @@ engine.config.root_dir   = "./ui/"
 
 ---
 
-### LNM Entry Point
+### Runtime config (the `lucyn` executable)
 
-```cpp
-engine.config.lnm.entry = "./ui/shell.lnm"
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `entry` | string | Root `.lnm` file the engine loads on startup |
-
-This is the first LNM file the engine parses. All other `.lnm` files are reached through `switch.replace`, `switch.overlay`, or `switch.tooltip` from here.
-
-For the `lucyn` executable, runtime configuration is supplied as JSON with `--config`. The current executable reads `lnm.entry`, `search.default`, and `search.searxng_url`; other fields in the C++ embedding API remain independent of this file format.
+For the `lucyn` executable, runtime configuration is supplied as JSON with `--config`. The current executable reads `search.default` and `search.searxng_url`; other fields in the C++ embedding API remain independent of this file format.
 
 ```json
 {
-  "lnm": {
-    "entry": "./ui/shell.lnm"
-  },
   "search": {
     "default": "brave",
     "searxng_url": "https://your-searxng-instance.example"
@@ -70,37 +57,7 @@ For the `lucyn` executable, runtime configuration is supplied as JSON with `--co
 }
 ```
 
-The entry path is relative to the config file. Paths in `grab(...)` and `switch.*` are relative to the entry file's directory. When an entry is configured, `lucyn` loads it at startup and presents its current view through the existing layout, software painter, and SDL window. The window is created hidden by default; pass `--show` to display it immediately, or use the JSON `window` command. While an LNM app is current, SDL mouse and text events can focus and edit `<input>` fields. An LNM `<input type="search">` submits through the configured search provider when Enter is pressed. Config files without `lnm.entry` start the normal engine without an LNM app.
-
----
-
-### Window
-
-```cpp
-engine.config.window.title     = "My Browser"
-engine.config.window.icon      = "./assets/icon.png"
-engine.config.window.frameless = false
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `title` | string | OS window title |
-| `icon` | string | OS window / taskbar icon |
-| `frameless` | bool | Remove native OS window chrome |
-
----
-
-### Tabs
-
-```cpp
-engine.config.allow_new_tab_addition = true
-engine.config.max_tabs               = 20
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `allow_new_tab_addition` | bool | Whether user can open new tabs |
-| `max_tabs` | int | Max concurrent tabs allowed |
+There is no `lnm.entry`, no `window.*` section, and no `--show`/`--ghostful` flags: the LNM interpreter, the SDL window and all browser chrome were removed in Session 18 (see `engine-history/SESSION18.md`). The engine is headless by design — `screenshot` is its only rendering output.
 
 ---
 
@@ -181,20 +138,14 @@ engine.config.fingerprint_profile   = "chrome130"  // chrome130 | firefox120 | c
 ### Moonbug (Network Inspector)
 
 ```cpp
-engine.config.moonbug.active        = true
-engine.config.moonbug.openable      = true
-engine.config.moonbug.tab_closeable = false
-engine.config.moonbug.allow_remove  = false
-engine.config.moonbug.allow_hide    = true
+engine.config.moonbug.active = true
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `active` | bool | Turns network capture on/off |
-| `openable` | bool | Whether user can open the moonbug tab |
-| `tab_closeable` | bool | Whether the moonbug tab can be closed |
-| `allow_remove` | bool | Fully disables moonbug from the build |
-| `allow_hide` | bool | Lets user hide moonbug tab without removing it |
+
+Moonbug is not a UI tab. It is a capture layer between libcurl and the engine, controlled from the JSON protocol (`{"cmd":"moonbug"}`) or `lucyn --moonbug`; the dashboard is served over loopback HTTP.
 
 ---
 
@@ -237,15 +188,15 @@ engine.iconshow.imageandname("./icon.png", "My Browser", "The best browser on Lu
 ```cpp
 engine.config.asset_mode = AssetMode::LOOSE_FILE
 ```
-- UI files read from disk
-- Edit HTML/LNM/JS → refresh → see changes instantly
+- Shell/UI files read from disk
+- Edit HTML/JS → refresh → see changes instantly
 - No recompile needed
 
 ### Production
 ```cpp
 engine.config.asset_mode = AssetMode::BINARY_EMBED
 ```
-- HTML/JS minified and baked into the binary by `lnmc`
+- HTML/JS baked into the binary
 - Single executable, zero loose files
 - Tamper-proof
 
@@ -255,13 +206,9 @@ engine.config.asset_mode = AssetMode::BINARY_EMBED
 
 | Concern | Handled by |
 |---|---|
-| Settings UI | `settings.html` + LNM |
-| No internet page | `offline.html` |
-| Color themes | LNM style blocks |
-| Error pages | `error.html` |
-| New tab page | `newtab.html` |
-| Web page rendering | Painter (C++) |
-| Complex UI logic | JS + LNM bridge |
+| Web page rendering | Painter (C++) — offscreen, PNG screenshots only |
+| Page behavior / UI logic | The page's own JS (QuickJS), driven through `eval`/`click` |
+| Browser chrome | Nothing — LucyN has none |
 
 ---
 
@@ -278,18 +225,9 @@ int main() {
     engine.config.iconpath = "./assets/phantom.png";
     engine.config.motto    = "Raw. Fast. Honest.";
 
-    // UI
+    // UI shell (script injection surface)
     engine.config.homepage("./ui/shell.html", "style.css", "app.js");
-    engine.config.lnm.entry  = "./ui/shell.lnm";
     engine.config.asset_mode = AssetMode::LOOSE_FILE;
-
-    // Window
-    engine.config.window.title     = "Phantom";
-    engine.config.window.frameless = false;
-
-    // Tabs
-    engine.config.allow_new_tab_addition = true;
-    engine.config.max_tabs               = 10;
 
     // Search
     engine.config.search.default = "brave";

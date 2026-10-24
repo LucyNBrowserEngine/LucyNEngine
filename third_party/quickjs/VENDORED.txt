@@ -1,4 +1,0 @@
-quickjs-ng/quickjs  v0.17.0   (MIT, see LICENSE)
-Source: https://github.com/quickjs-ng/quickjs/releases/tag/v0.17.0  (codeload tarball)
-Only the files needed to build the engine as a static library are kept (no qjs/qjsc/libc/tests/test262).
-Do not edit these files: re-vendor from a newer tag instead.
