@@ -40,7 +40,7 @@ cmake --build build -j
 | Platform | Status |
 |----------|--------|
 | Linux x64 | ✅ Supported |
-| Linux arm64 | ✅ Supported |
+| Linux arm64 | Not supported now but in the next 3rd version it is expected to be supported|
 | Windows x64 | 🚧 Builds are currently erroring. We are investigating the cause; Windows is not supported for now. |
 | macOS | ⏳ Planned |
 
