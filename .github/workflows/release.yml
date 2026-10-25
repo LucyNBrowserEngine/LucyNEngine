@@ -1,0 +1,153 @@
+name: Release
+
+# Builds the engine on every platform and publishes one GitHub Release per v*.*.* tag.
+# Nothing is published unless EVERY platform's ctest passes: the release job has `needs: build`,
+# so any red matrix leg cancels it.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write          # needed to create the release and upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false       # build all platforms even if one fails; the release job still waits for all
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04
+            platform: linux64
+            artifact: lucyn-linux-x64.tar.gz
+            # Statically link the toolchain runtime so only libcef.so (and libc) stay dynamic.
+            cmake_flags: '-DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"'
+          - name: macos-x64
+            os: macos-13
+            platform: macosx64
+            artifact: lucyn-macos-x64.tar.gz
+            cmake_flags: ''
+          - name: macos-arm64
+            os: macos-14
+            platform: macosarm64
+            artifact: lucyn-macos-arm64.tar.gz
+            cmake_flags: ''
+          - name: windows-x64
+            os: windows-2022
+            platform: windows64
+            artifact: lucyn-windows-x64.zip
+            cmake_flags: ''
+    defaults:
+      run:
+        shell: bash         # Git Bash on Windows, bash on Linux/macOS — one script surface
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history: the auto-generated notes walk commits since the last tag
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ python3 ca-certificates curl
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list cmake  >/dev/null 2>&1 || brew install cmake
+          brew list ninja  >/dev/null 2>&1 || brew install ninja
+
+      # Windows: MSVC (Visual Studio 2022), CMake, curl and tar are preinstalled on windows-2022.
+      # CEF's own CMake machinery picks the MSVC toolset; no extra packages needed.
+
+      - name: Fetch CEF
+        run: ./scripts/install.sh --yes --platform ${{ matrix.platform }}
+
+      - name: Configure (Release)
+        if: runner.os != 'Windows'
+        run: >
+          cmake -S . -B build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          ${{ matrix.cmake_flags }}
+
+      - name: Configure (Release, multi-config MSVC)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # If the tests fail, the job stops here and the release job never runs.
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/scripts
+          cp build/bin/lucyn   dist/lucyn
+          cp scripts/install.sh scripts/update_cef.sh dist/scripts/
+          chmod +x dist/lucyn dist/scripts/*.sh
+          # The bundle carries the engine binary and the CEF install scripts — no CEF, no sources.
+          tar -czf "${{ matrix.artifact }}" -C dist lucyn scripts
+          ls -la "${{ matrix.artifact }}"
+          tar -tzf "${{ matrix.artifact }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/scripts | Out-Null
+          Copy-Item build/bin/lucyn.exe dist/lucyn.exe
+          Copy-Item scripts/install.ps1 scripts/update_cef.ps1 dist/scripts/
+          Compress-Archive -Path dist/lucyn.exe, dist/scripts -DestinationPath "${{ matrix.artifact }}" -Force
+          Get-Item "${{ matrix.artifact }}" | Format-List Name, Length
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build             # any failed/aborted matrix leg blocks this job
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la dist/
+
+      - name: Create release with auto-generated notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*
+          # GitHub writes the notes from the commits/PRs since the previous tag,
+          # grouped by the categories in .github/release.yml.
+          generate_release_notes: true
+          fail_on_unmatched_files: true

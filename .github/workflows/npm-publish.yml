@@ -1,0 +1,54 @@
+name: Publish npm package
+
+# Same v*.*.* tag as the release: publishes client/ as `nothing-browser`.
+# The package version is set from the tag here (client/package.json is committed with a
+# placeholder version), so v3.1.0 -> "version": "3.1.0" in the tarball that ships.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish nothing-browser
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set package version from the git tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"          # v3.1.0 -> 3.1.0
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag '$GITHUB_REF_NAME' is not vMAJOR.MINOR.PATCH" >&2; exit 1 ;;
+          esac
+          npm version --no-git-tag-version --allow-same-version "$VERSION"
+          echo "Publishing nothing-browser@$VERSION"
+          node -e 'const p=require("./package.json"); \
+            if(p.name!=="nothing-browser") throw new Error("package name is "+p.name); \
+            if(!require("fs").existsSync(p.main)) throw new Error("main missing: "+p.main); \
+            console.log(p.name, p.version, "main:", p.main)'
+
+      - name: Dry run (what npm would publish)
+        run: npm pack --dry-run
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

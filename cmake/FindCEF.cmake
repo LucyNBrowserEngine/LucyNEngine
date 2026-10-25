@@ -39,9 +39,9 @@ if(NOT EXISTS "${CEF_ROOT}/cmake/cef_variables.cmake" OR
     "Expected an unpacked CEF binary distribution (include/, libcef_dll/, cmake/, "
     "Release/, Resources/). Set CEF_ROOT to point at one.")
 endif()
-if(NOT EXISTS "${CEF_ROOT}/Release/libcef.so")
+if(NOT IS_DIRECTORY "${CEF_ROOT}/Release")
   message(FATAL_ERROR
-    "CEF distribution at ${CEF_ROOT} is incomplete: Release/libcef.so is missing.")
+    "CEF distribution at ${CEF_ROOT} is incomplete: Release/ is missing.")
 endif()
 
 # ---- load the distribution's own CMake machinery ----------------------------------------------
@@ -66,7 +66,30 @@ if(NOT TARGET libcef_dll_wrapper)
   add_subdirectory("${CEF_LIBCEF_DLL_WRAPPER_PATH}" libcef_dll_wrapper)
 endif()
 
-# ---- libcef.so as an imported target -----------------------------------------------------------
+# ---- libcef itself as an imported target ---------------------------------------------------------
+# The distro's own cef_variables.cmake gives us the platform-correct path on Linux
+# (Release/libcef.so) and Windows (Release/libcef.lib for linking, libcef.dll at run time).
+# macOS is the odd one: that file does NOT set CEF_LIB_RELEASE there, so probe the
+# layouts CEF has shipped for macOS and fail with an actionable message if none match.
+if(NOT CEF_LIB_RELEASE)
+  foreach(_cef_candidate
+      "${CEF_BINARY_DIR_RELEASE}/libcef.dylib"
+      "${_CEF_ROOT}/libcef_dylib/libcef.dylib"
+      "${_CEF_ROOT}/libcef_dylib/libcef.so")
+    if(EXISTS "${_cef_candidate}")
+      set(CEF_LIB_RELEASE "${_cef_candidate}")
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT CEF_LIB_RELEASE OR NOT EXISTS "${CEF_LIB_RELEASE}")
+  message(FATAL_ERROR
+    "Could not locate libcef in the CEF distribution at ${CEF_ROOT}.\n"
+    "Expected Release/libcef.so (Linux), Release/libcef.lib (Windows) or a libcef.dylib\n"
+    "under Release/ or libcef_dylib/ (macOS). Set CEF_LIB_RELEASE to the real path if\n"
+    "your distro puts it somewhere else.")
+endif()
+
 if(NOT TARGET lucyn_libcef)
   add_library(lucyn_libcef SHARED IMPORTED GLOBAL)
   set_target_properties(lucyn_libcef PROPERTIES
@@ -97,9 +120,16 @@ target_compile_definitions(lucyn_cef INTERFACE
   # — without this CEF aborts with "Invalid file descriptor to ICU data".
   LUCYN_CEF_RESOURCES_DIR="${_CEF_ROOT}/Resources"
 )
-# libcef.so is copied next to the binaries (see lucyn_cef_copy_runtime below), so
-# the binary must find it relative to itself, wherever it is run from.
-target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,$ORIGIN")
+# The library is copied next to the binaries (see lucyn_cef_copy_runtime below), so the
+# binary must find it relative to itself, wherever it is run from.
+if(WIN32)
+  # MSVC has no rpath concept: Windows looks for a DLL beside the .exe.
+elseif(APPLE)
+  # $ORIGIN is an ELF-ism; Mach-O resolves siblings through @loader_path.
+  target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,@loader_path")
+else()
+  target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,$ORIGIN")
+endif()
 
 file(STRINGS "${_CEF_ROOT}/include/cef_version.h" _cef_version_line REGEX "^#define CEF_VERSION \"")
 string(REGEX REPLACE "^.*CEF_VERSION \"([^\"]+)\".*$" "\\1" _cef_version "${_cef_version_line}")

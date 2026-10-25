@@ -21,6 +21,10 @@ PLATFORM=""
 log() { printf '%s\n' "$*"; }
 err() { printf 'update_cef.sh: error: %s\n' "$*" >&2; exit 1; }
 
+# python3 on Linux/macOS; Windows (Git Bash) usually only has `python`.
+PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+py()  { [ -n "$PYTHON" ] || err "python3 (or python) is required to read the CEF build index"; "$PYTHON" "$@"; }
+
 usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
@@ -33,7 +37,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-command -v python3 >/dev/null 2>&1 || err "python3 is required to read the CEF build index"
+[ -n "$PYTHON" ] || err "python3 (or python) is required to read the CEF build index"
 [ -x "$INSTALL" ] || [ -f "$INSTALL" ] || err "missing $INSTALL"
 
 # --- what is installed now ---------------------------------------------------
@@ -72,7 +76,7 @@ if [ -z "$PLATFORM" ]; then
     esac
 fi
 
-CEF_INDEX_URL="$INDEX_URL" CEF_PLATFORM="$PLATFORM" python3 - <<'PY' > /tmp/lucyn_cef_latest.$$
+CEF_INDEX_URL="$INDEX_URL" CEF_PLATFORM="$PLATFORM" py - <<'PY' > /tmp/lucyn_cef_latest.$$
 import json, os, sys, urllib.request
 try:
     with urllib.request.urlopen(os.environ["CEF_INDEX_URL"], timeout=120) as r:

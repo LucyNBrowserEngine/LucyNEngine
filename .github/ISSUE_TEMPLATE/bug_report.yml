@@ -13,19 +13,14 @@ body:
       multiple: true
       options:
         - modules/adblock
+        - modules/cef_host
         - modules/controller
         - modules/core
-        - modules/dom
-        - modules/js
-        - modules/layout
         - modules/logger
         - modules/net
-        - modules/paint
-        - modules/profile
+        - modules/search
         - modules/security
         - modules/server
-        - modules/shell
-        - modules/ui
         - apps/lucyn
         - client
         - dashboard

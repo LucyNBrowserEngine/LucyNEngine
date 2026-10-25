@@ -1,0 +1,71 @@
+name: CI
+
+# Every push and every pull request targeting main: one Linux build + the full test suite.
+# The job name ("build-and-test") is what shows up as the green/red check on a PR — a red
+# ctest run fails the job, which blocks the PR when branch protection requires this check.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true     # a newer push supersedes an in-flight run
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ python3 ca-certificates curl
+
+      # The CEF distro is ~663 MB — the single biggest CI cost. Resolve the version the
+      # index currently calls "latest stable" and key the cache on it, so the cache is
+      # refreshed exactly when CEF moves and install.sh skips the download on a hit.
+      - name: Resolve CEF version
+        id: cef
+        run: |
+          version=$(python3 - <<'PY'
+          import json, urllib.request
+          with urllib.request.urlopen("https://cef-builds.spotifycdn.com/index.json", timeout=120) as r:
+              data = json.load(r)
+          stable = [v for v in data["linux64"].get("versions", []) if v.get("channel") == "stable"]
+          print(stable[0]["cef_version"] if stable else "unknown")
+          PY
+          )
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "CEF version: $version"
+
+      - name: Cache CEF
+        id: cef-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/cef
+          key: cef-linux64-${{ steps.cef.outputs.version }}
+
+      - name: Fetch CEF
+        run: ./scripts/install.sh --yes --platform linux64
+
+      - name: Configure (Release)
+        run: >
+          cmake -S . -B build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

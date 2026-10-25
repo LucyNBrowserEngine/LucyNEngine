@@ -2,11 +2,12 @@
 
 `client/` holds the npm package **`nothing-browser`**: it spawns the `lucyn` binary as a child
 process and drives it over the JSON command protocol (see [commands.md](commands.md)). Node 18+,
-ESM, zero dependencies.
+ESM, zero dependencies. The source is TypeScript (`src/index.ts`); Node 22.18+ imports `.ts`
+directly, older runtimes need a TS-aware loader (tsx, deno, bun) or a bundler.
 
 ```bash
-# from the repo root, after building
-node -e 'import("./client/src/index.js").then(m => console.log(typeof m.default))'   # -> function
+# from the repo root, after building — smoke-test the source with a TS-aware runtime
+npx tsx -e 'import("./client/src/index.ts").then(m => console.log(typeof m.default))'   # -> function
 # or, as a package:
 cd client && npm link        # then: import Lucyn from "nothing-browser"
 ```

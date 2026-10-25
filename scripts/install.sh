@@ -26,6 +26,10 @@ CHECK_ONLY=0
 log()  { printf '%s\n' "$*"; }
 err()  { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
 
+# python3 on Linux/macOS; Windows (Git Bash) usually only has `python`.
+PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+py()  { [ -n "$PYTHON" ] || err "python3 (or python) is required to read the CEF build index"; "$PYTHON" "$@"; }
+
 usage() {
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
@@ -73,9 +77,9 @@ print_detected() {
 # ------------------------------------------------------------- index query ---
 # Writes:  VERSION<TAB>FILENAME<TAB>SHA1<TAB>SIZE   for the wanted build.
 query_index() {
-    command -v python3 >/dev/null 2>&1 || err "python3 is required to read the CEF build index"
+    [ -n "$PYTHON" ] || err "python3 (or python) is required to read the CEF build index"
     CEF_INDEX_URL="$INDEX_URL" CEF_PLATFORM="$PLATFORM" CEF_WANT="$WANT_VERSION" CEF_TYPE="$DISTRO_TYPE" \
-    python3 - <<'PY'
+    py - <<'PY'
 import json, os, sys, urllib.request
 
 url, plat, want, dtype = (os.environ[k] for k in
@@ -125,7 +129,7 @@ sha1_of() {
 extract_tarball() {
     local archive="$1" dest="$2"
     if tar -xjf "$archive" -C "$dest" 2>/dev/null; then return 0; fi
-    python3 - "$archive" "$dest" <<'PY'   # bzip2 via Python, for hosts whose tar has no -j
+    py - "$archive" "$dest" <<'PY'   # bzip2 via Python, for hosts whose tar has no -j
 import sys, tarfile
 with tarfile.open(sys.argv[1], "r:bz2") as t:
     t.extractall(sys.argv[2])
