@@ -95,11 +95,35 @@ One-shot download without the JSON loop:
 
 ## Node.js client
 
-The `client/` package (**`nothing-browser`**, Node 18+, ESM, no dependencies) spawns the engine
-and turns every command into a promise.
+The `client/` package (**[`@lucyn/browser`](https://jsr.io/@lucyn/browser)**, Node 18+, ESM, no
+dependencies) spawns the engine and turns every command into a promise.
+
+```bash
+npx jsr add @lucyn/browser
+```
+
+> **This package lives on JSR, not npm.** Its registry entry is
+> [jsr.io/@lucyn/browser](https://jsr.io/@lucyn/browser). `npm i @lucyn/browser` does **not** work
+> — npm cannot fetch it directly. `npx jsr add @lucyn/browser` is the correct install command: it
+> downloads from JSR and wires up the npm-compatible import for you (JSR handles the registry
+> translation automatically).
+
+### Why JSR and not npm?
+
+You might wonder why this isn't just `npm i`. Honest answer: publishing to npm wanted about three
+tokens, and we only had one — figuring out how to get the other two was a bit of a chore. JSR was
+the next and nearest easy one, so that's where the package lives. Everything else works the same:
+
+```bash
+npx jsr add @lucyn/browser    # correct
+npm i @lucyn/browser          # does not work — the package is not on npm
+```
+
+So: don't use `npm i`, use `npx jsr add`. It does the npm-registry compatibility for you, so your
+`import` statement looks exactly like a normal package afterwards.
 
 ```js
-import Lucyn from "nothing-browser";
+import Lucyn from "@lucyn/browser";
 
 const a = new Lucyn();
 
@@ -153,7 +177,7 @@ Everything about what a capture holds, the endpoints and the sealing: **[docs/mo
 apps/lucyn/        the engine binary (JSON over stdio)
 modules/           core, net (Moonbug), security, server, search, logger,
                    adblock, cef_host (Chromium host), controller (command loop)
-client/            the nothing-browser Node.js package
+client/            the @lucyn/browser Node.js package
 dashboard/         capture dashboard assets
 scripts/           install.sh, update_cef.sh
 third_party/       cef/ (binary distro, downloaded) + mongoose (vendored)
@@ -166,7 +190,7 @@ engine-history/    build history: SESSION*.md, HANDOFF.md, CHANGES.md, AGENTS.md
 | Doc | |
 |---|---|
 | [docs/commands.md](docs/commands.md) | every JSON command, its arguments, reply shape and errors |
-| [docs/node-client.md](docs/node-client.md) | the `nothing-browser` package, method by method |
+| [docs/node-client.md](docs/node-client.md) | the `@lucyn/browser` package, method by method |
 | [docs/moonbug.md](docs/moonbug.md) | captures, the dashboard, NULLBYTE signing |
 | [docs/building.md](docs/building.md) | prerequisites, CMake options, tests, troubleshooting |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | how to propose changes |

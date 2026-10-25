@@ -1,4 +1,4 @@
-# nothing-browser
+# @lucyn/browser
 
 JS client for the LucyN headless engine. Spawns `lucyn` as a child process and
 drives it over the M4 JSON command protocol.
@@ -6,9 +6,29 @@ drives it over the M4 JSON command protocol.
 ## Install
 
 ```bash
-# From the monorepo root after building LucyN:
-cd client
-npm link   # or just: import Lucyn from "./client/src/index.ts"
+npx jsr add @lucyn/browser
+```
+
+**This package lives on JSR, not npm.** Its home is [jsr.io/@lucyn/browser](https://jsr.io/@lucyn/browser).
+`npm i @lucyn/browser` does **not** work — npm cannot fetch it directly. `npx jsr add @lucyn/browser`
+is the correct install command: it downloads from JSR and handles the npm-registry compatibility for
+you automatically, so your `import` resolves like any other package.
+
+**Why JSR and not npm?** You might wonder why this isn't just `npm i`. Honest answer: publishing to
+npm wanted about three tokens, and we only had one — figuring out how to get the other two was a bit
+of a chore. JSR was the next and nearest easy one, so that's where the package lives. So: don't use
+`npm i`, use `npx jsr add`.
+
+```bash
+npx jsr add @lucyn/browser    # correct
+npm i @lucyn/browser          # does not work — the package is not on npm
+```
+
+Working inside this repo instead?
+
+```bash
+# from the monorepo root after building LucyN — a repo-local dev convenience, not the install path
+cd client && npm link    # or just: import Lucyn from "./client/src/index.ts"
 ```
 
 The client looks for the `lucyn` binary in this order:
@@ -19,7 +39,7 @@ The client looks for the `lucyn` binary in this order:
 ## Usage
 
 ```js
-import Lucyn from "nothing-browser";
+import Lucyn from "@lucyn/browser";
 
 const a = new Lucyn({
   settleTimeoutMs: 5000,      // JS idle timeout per visit

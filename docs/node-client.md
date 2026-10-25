@@ -1,16 +1,44 @@
-# nothing-browser — the Node.js client
+# @lucyn/browser — the Node.js client
 
-`client/` holds the npm package **`nothing-browser`**: it spawns the `lucyn` binary as a child
-process and drives it over the JSON command protocol (see [commands.md](commands.md)). Node 18+,
-ESM, zero dependencies. The source is TypeScript (`src/index.ts`); Node 22.18+ imports `.ts`
-directly, older runtimes need a TS-aware loader (tsx, deno, bun) or a bundler.
+`client/` holds the JSR package **[`@lucyn/browser`](https://jsr.io/@lucyn/browser)**: it spawns
+the `lucyn` binary as a child process and drives it over the JSON command protocol (see
+[commands.md](commands.md)). Node 18+, ESM, zero dependencies. The source is TypeScript
+(`src/index.ts`); Node 22.18+ imports `.ts` directly, older runtimes need a TS-aware loader (tsx,
+deno, bun) or a bundler.
+
+## Install
+
+```bash
+npx jsr add @lucyn/browser
+```
+
+**The package lives on JSR, not npm.** Its home is [jsr.io/@lucyn/browser](https://jsr.io/@lucyn/browser).
+`npm i @lucyn/browser` does not work — npm cannot read the JSR registry directly, so the install
+fails. `npx jsr add @lucyn/browser` is the correct command: it fetches from JSR and handles the npm
+registry compatibility for you automatically, so the package then resolves from a normal `import`.
+No `--allow-slow-types`, no extra flags, and no npm account or token is involved on your side.
+
+### Why JSR and not npm?
+
+You might wonder why this isn't just `npm i`. Honest answer: publishing to npm wanted about three
+tokens, and we only had one — figuring out how to get the other two was a bit of a chore. JSR was
+the next and nearest easy one, so that's where the package lives. Everything else works the same:
+
+```bash
+npx jsr add @lucyn/browser    # correct
+npm i @lucyn/browser          # does not work — the package is not on npm
+```
+
+So: don't use `npm i`, use `npx jsr add`. It does the npm-registry compatibility for you, so your
+`import` statement looks exactly like a normal package afterwards.
 
 ```bash
 # from the repo root, after building — smoke-test the source with a TS-aware runtime
 npx tsx -e 'import("./client/src/index.ts").then(m => console.log(typeof m.default))'   # -> function
-# or, as a package:
-cd client && npm link        # then: import Lucyn from "nothing-browser"
 ```
+
+Working inside this repo instead? `cd client && npm link` puts the checkout on your `node_modules`
+path for local development — that is a repo convenience, not the install path for users.
 
 **Finding the binary.** In order: `opts.binary` → `LUCYN_BIN` env var → `../../build/bin/lucyn`
 (the monorepo default after `cmake --build build`) → `lucyn` on `PATH`.
@@ -18,7 +46,7 @@ cd client && npm link        # then: import Lucyn from "nothing-browser"
 ## Quick start
 
 ```js
-import Lucyn from "nothing-browser";
+import Lucyn from "@lucyn/browser";
 
 const a = new Lucyn();
 
