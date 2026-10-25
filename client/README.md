@@ -8,7 +8,7 @@ drives it over the M4 JSON command protocol.
 ```bash
 # From the monorepo root after building LucyN:
 cd client
-npm link   # or just: import Lucyn from "./client/src/index.js"
+npm link   # or just: import Lucyn from "./client/src/index.ts"
 ```
 
 The client looks for the `lucyn` binary in this order:

@@ -1,15 +1,36 @@
 {
-  "name": "nothing-browser",
-  "version": "3.0.0",
-  "description": "JS client for the LucyN headless browser engine (M7)",
+  "name": "@lucyn/browser",
+  "version": "0.1.0",
+  "description": "JS client for the LucyN browser engine — a scraping-first, Chromium-powered headless browser driven over JSON stdio",
   "type": "module",
-  "main": "./src/index.js",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node -e \"console.log('nothing-browser: the LucyN engine binary is not bundled with this package. Download it from https://github.com/LucyNBrowserEngine/LucyNEngine/releases and point LUCYN_BIN at it, e.g. export LUCYN_BIN=/path/to/lucyn')\""
   },
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["browser", "headless", "scraper", "lucyn", "nothing-browser"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LucyNBrowserEngine/LucyNEngine.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LucyNBrowserEngine/LucyNEngine/issues"
+  },
+  "homepage": "https://github.com/LucyNBrowserEngine/LucyNEngine#readme",
+  "keywords": [
+    "browser",
+    "scraping",
+    "automation",
+    "chromium"
+  ],
   "license": "MIT"
 }
