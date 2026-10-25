@@ -56,6 +56,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef __APPLE__
+  #include <mach-o/dyld.h>   // _NSGetExecutablePath: our own path, for browser_subprocess_path
+  #include <filesystem>
+#endif
+
 #include "lucyn/core/paths.h"
 
 // Session 19 step 10: third_party/stb was deleted along with the old engine, so the
@@ -1098,6 +1103,47 @@ bool initCef(int argc, char** argv) {
     // Release/ — which aborts with the cryptic "Invalid file descriptor to ICU data".
     // So: use the files beside the executable when they are there, else the build-time
     // distro (the same relocation philosophy as the rpath fallback).
+#ifdef __APPLE__
+    {
+        // macOS differs twice over: libcef IS the framework binary, and icudtl.dat, *.pak
+        // and the *.lproj locales live INSIDE
+        // Chromium Embedded Framework.framework/Resources — there is no flat icudtl.dat
+        // beside the executable and the macOS distro has no top-level Resources/ at all.
+        // CEF derives resources_dir_path/locales_dir_path from framework_dir_path, so that
+        // is the one to set: the framework lucyn_cef_copy_runtime() dropped beside the
+        // executable, else the distro's Release/ one.
+        std::string framework;
+        const std::string exe = core::exeDir();
+        if (!exe.empty()) {
+            const std::string beside = exe + "/Chromium Embedded Framework.framework";
+            if (std::ifstream(beside + "/Resources/icudtl.dat", std::ios::binary).good())
+                framework = beside;
+        }
+        if (framework.empty()) {
+#ifdef LUCYN_CEF_FRAMEWORK_DIR
+            if (LUCYN_CEF_FRAMEWORK_DIR[0]) framework = LUCYN_CEF_FRAMEWORK_DIR;
+#endif
+        }
+        if (!framework.empty())
+            CefString(&settings.framework_dir_path).FromString(framework);
+
+        // AND: browser_subprocess_path. A bare Mach-O executable is not an app bundle, so
+        // CEF's macOS default for an empty value — "Contents/Frameworks/<app> Helper.app/..."
+        // in the top-level app bundle — cannot resolve (cef_types.h, browser_subprocess_path).
+        // Point it at THIS executable instead: main.cpp routes argv through
+        // executeCefProcess(), which returns -1 in the browser process and hands the
+        // renderer/GPU/network children their CefApp for --type=... invocations.
+        uint32_t exeSz = 0;
+        _NSGetExecutablePath(nullptr, &exeSz);
+        std::vector<char> exeBuf(exeSz + 1);
+        if (_NSGetExecutablePath(exeBuf.data(), &exeSz) == 0) {
+            std::error_code ec;
+            std::filesystem::path self = std::filesystem::canonical(exeBuf.data(), ec);
+            if (!ec)
+                CefString(&settings.browser_subprocess_path).FromString(self.string());
+        }
+    }
+#else
     {
         std::string resources;
         const std::string exe = core::exeDir();
@@ -1115,6 +1161,7 @@ bool initCef(int argc, char** argv) {
             CefString(&settings.locales_dir_path).FromString(resources + "/locales");
         }
     }
+#endif
 
     if (!CefInitialize(main_args, settings, g_app, nullptr)) {
         g_app = nullptr;

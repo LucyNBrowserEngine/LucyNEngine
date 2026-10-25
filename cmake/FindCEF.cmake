@@ -69,11 +69,18 @@ endif()
 # ---- libcef itself as an imported target ---------------------------------------------------------
 # The distro's own cef_variables.cmake gives us the platform-correct path on Linux
 # (Release/libcef.so) and Windows (Release/libcef.lib for linking, libcef.dll at run time).
-# macOS is the odd one: that file does NOT set CEF_LIB_RELEASE there, so probe the
+# macOS is the odd one: that file does NOT set CEF_LIB_RELEASE there at all, so probe the
 # layouts CEF has shipped for macOS and fail with an actionable message if none match.
+# Since CEF 100-ish the macOS standard distribution has no bare libcef.dylib — libcef IS
+# the framework binary:
+#   Release/Chromium Embedded Framework.framework/Chromium Embedded Framework
+# (verified against cef_binary_156.0.14_*_macosarm64.tar.bz2: Release/ holds nothing but
+# that framework). Older flat layouts kept libcef.dylib in Release/ or libcef_dylib/.
 if(NOT CEF_LIB_RELEASE)
   foreach(_cef_candidate
       "${CEF_BINARY_DIR_RELEASE}/libcef.dylib"
+      "${CEF_BINARY_DIR_RELEASE}/Chromium Embedded Framework.framework/Chromium Embedded Framework"
+      "${CEF_BINARY_DIR_RELEASE}/Chromium Embedded Framework.framework/Versions/A/Chromium Embedded Framework"
       "${_CEF_ROOT}/libcef_dylib/libcef.dylib"
       "${_CEF_ROOT}/libcef_dylib/libcef.so")
     if(EXISTS "${_cef_candidate}")
@@ -85,9 +92,15 @@ endif()
 if(NOT CEF_LIB_RELEASE OR NOT EXISTS "${CEF_LIB_RELEASE}")
   message(FATAL_ERROR
     "Could not locate libcef in the CEF distribution at ${CEF_ROOT}.\n"
-    "Expected Release/libcef.so (Linux), Release/libcef.lib (Windows) or a libcef.dylib\n"
-    "under Release/ or libcef_dylib/ (macOS). Set CEF_LIB_RELEASE to the real path if\n"
+    "Expected Release/libcef.so (Linux), Release/libcef.lib (Windows) or\n"
+    "Release/Chromium Embedded Framework.framework/Chromium Embedded Framework (macOS;\n"
+    "bare libcef.dylib only on older distros). Set CEF_LIB_RELEASE to the real path if\n"
     "your distro puts it somewhere else.")
+endif()
+# The framework, on macOS (empty elsewhere): the whole bundle, dylib + Resources/ inside it.
+set(CEF_FRAMEWORK_RELEASE "")
+if(APPLE AND IS_DIRECTORY "${CEF_BINARY_DIR_RELEASE}/Chromium Embedded Framework.framework")
+  set(CEF_FRAMEWORK_RELEASE "${CEF_BINARY_DIR_RELEASE}/Chromium Embedded Framework.framework")
 endif()
 
 if(NOT TARGET lucyn_libcef)
@@ -110,15 +123,24 @@ target_link_libraries(lucyn_cef INTERFACE
 # Defines every CEF consumer needs (mirrors the distro's CEF_COMPILER_DEFINES for
 # Linux minus per-build-type ones; do NOT pull in the full flag list — it carries
 # -Werror/-fno-exceptions, which are wrapper-build-only concerns).
+# Where icudtl.dat, *.pak and locales/ live in THIS distro — initCef() points CEF here when a
+# relocated binary has no runtime files beside it: such a binary loads libcef from the distro's
+# Release/ (rpath fallback) but the data files live elsewhere — without them CEF aborts with
+# "Invalid file descriptor to ICU data". Linux/Windows keep them in a top-level Resources/;
+# on macOS they are inside the framework (the macOS distro has NO top-level Resources/).
+if(CEF_FRAMEWORK_RELEASE)
+  set(_lucyn_cef_resources "${CEF_FRAMEWORK_RELEASE}/Resources")
+else()
+  set(_lucyn_cef_resources "${_CEF_ROOT}/Resources")
+endif()
 target_compile_definitions(lucyn_cef INTERFACE
   __STDC_CONSTANT_MACROS
   __STDC_FORMAT_MACROS
   _FILE_OFFSET_BITS=64
-  # Distro Resources/ (icudtl.dat, *.pak, locales/). initCef() points CEF here when a
-  # relocated binary has no runtime files beside it: such a binary loads libcef.so from
-  # the distro's Release/ (INSTALL_RPATH fallback) but icudtl.dat lives in Resources/
-  # — without this CEF aborts with "Invalid file descriptor to ICU data".
-  LUCYN_CEF_RESOURCES_DIR="${_CEF_ROOT}/Resources"
+  LUCYN_CEF_RESOURCES_DIR="${_lucyn_cef_resources}"
+  # macOS only: absolute path of the distro's Chromium Embedded Framework.framework,
+  # used by initCef() as the framework_dir_path when nothing sits beside the binary.
+  LUCYN_CEF_FRAMEWORK_DIR="${CEF_FRAMEWORK_RELEASE}"
 )
 # The library is copied next to the binaries (see lucyn_cef_copy_runtime below), so the
 # binary must find it relative to itself, wherever it is run from.
@@ -148,6 +170,14 @@ function(lucyn_cef_copy_runtime)
     set(_dst "${CMAKE_BINARY_DIR}/bin")
   endif()
   file(MAKE_DIRECTORY "${_dst}")
+  # macOS: CEF_BINARY_FILES is empty for the mac distro (cef_variables.cmake only fills it
+  # in for Linux and Windows), so copy the whole framework instead — dylib, Libraries/ and
+  # Resources/ (icudtl.dat, *.pak, *.lproj) in one go. CEF resolves the framework next to the
+  # executable through the @loader_path rpath set above.
+  if(APPLE AND CEF_FRAMEWORK_RELEASE AND IS_DIRECTORY "${CEF_FRAMEWORK_RELEASE}")
+    file(COPY "${CEF_FRAMEWORK_RELEASE}" DESTINATION "${_dst}")
+    return()
+  endif()
   foreach(_f IN LISTS CEF_BINARY_FILES)
     if(EXISTS "${CEF_BINARY_DIR_RELEASE}/${_f}")
       file(COPY "${CEF_BINARY_DIR_RELEASE}/${_f}" DESTINATION "${_dst}")

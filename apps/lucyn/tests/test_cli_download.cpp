@@ -1,6 +1,13 @@
 // `lucyn --download <url>`: the ONE-COMMAND path. Runs the real binary (copied into a temp folder so its
 // nothing-data/ lands there) against a loopback server and checks the contract: exactly one line on stdout
 // (the saved path), exit code 0 on success and 1 on failure with nothing on stdout, nothing left half-written.
+// Uses popen/waitpid and mini_server.h (POSIX sockets), so it is skipped on Windows — this guard is
+// what keeps the windows-x64 release build green.
+#ifdef _WIN32
+#include <cstdio>
+int main() { std::puts("SKIP: cli_download uses POSIX popen/wait and sockets"); return 0; }
+#else
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -106,3 +113,4 @@ int main(int argc, char** argv) {
     if (failures == 0) std::printf("cli_download: all checks passed\n");
     return failures == 0 ? 0 : 1;
 }
+#endif  // !_WIN32

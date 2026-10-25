@@ -21,6 +21,15 @@ option(LUCYN_MODULE_SEARCH  "Search provider registry (free web search URL templ
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
+# Multi-config generators (Visual Studio on Windows) would otherwise append a per-config
+# subfolder (build/bin/Release), which would separate lucyn.exe from the CEF runtime files
+# lucyn_cef_copy_runtime() copies into build/bin — and break the release packaging step,
+# which copies build/bin/lucyn.exe. Pin every configuration to the same flat folder.
+foreach(_lucyn_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+  if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_lucyn_cfg})
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_lucyn_cfg} "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+  endif()
+endforeach()
 
 enable_testing()
 
@@ -113,9 +122,16 @@ if(LUCYN_MODULE_CONTROLLER
     #   cef/Release (last)     -> lets the binary at least LOAD if build/bin itself
     #                             is gone.
     # Set explicitly so we never depend on link order; for a build/bin run $ORIGIN
-    # always wins over both fallbacks.
+    # always wins over both fallbacks. macOS has no $ORIGIN (ELF-ism) — there the
+    # sibling directory is @loader_path, and the "framework" entry is the distro's
+    # Chromium Embedded Framework.framework (libcef IS that framework's binary).
+    if(APPLE)
+      set(_lucyn_rpath "@loader_path;${CMAKE_RUNTIME_OUTPUT_DIRECTORY};${CEF_BINARY_DIR_RELEASE}")
+    else()
+      set(_lucyn_rpath "$ORIGIN;${CMAKE_RUNTIME_OUTPUT_DIRECTORY};${CEF_BINARY_DIR_RELEASE}")
+    endif()
     set_target_properties(lucyn PROPERTIES
-      INSTALL_RPATH "$ORIGIN;${CMAKE_RUNTIME_OUTPUT_DIRECTORY};${CEF_BINARY_DIR_RELEASE}"
+      INSTALL_RPATH "${_lucyn_rpath}"
       BUILD_WITH_INSTALL_RPATH TRUE)
     lucyn_cef_copy_runtime()
   endif()

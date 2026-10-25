@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ python3 ca-certificates curl
+            cmake ninja-build g++ python3 ca-certificates curl xvfb xauth
 
       # The CEF distro is ~663 MB — the single biggest CI cost. Resolve the version the
       # index currently calls "latest stable" and key the cache on it, so the cache is
@@ -67,5 +67,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # CEF needs a display to initialise (tests 6 and 8 drive a real Chromium); a runner has
+      # none, so give it a virtual one. --auto-servernum picks a free display number.
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: xvfb-run --auto-servernum ctest --test-dir build --output-on-failure
