@@ -1,12 +1,12 @@
 name: Release
 
-# Builds the engine on every platform and publishes one GitHub Release per v*.*.* tag.
+# Builds the engine on every platform and publishes one GitHub Release per V*.*.* tag.
 # Nothing is published unless EVERY platform's ctest passes: the release job has `needs: build`,
 # so any red matrix leg cancels it.
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "V*.*.*"
 
 permissions:
   contents: write          # needed to create the release and upload assets
@@ -30,16 +30,6 @@ jobs:
             artifact: lucyn-linux-x64.tar.gz
             # Statically link the toolchain runtime so only libcef.so (and libc) stay dynamic.
             cmake_flags: '-DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"'
-          - name: macos-x64
-            os: macos-13
-            platform: macosx64
-            artifact: lucyn-macos-x64.tar.gz
-            cmake_flags: ''
-          - name: macos-arm64
-            os: macos-14
-            platform: macosarm64
-            artifact: lucyn-macos-arm64.tar.gz
-            cmake_flags: ''
           - name: windows-x64
             os: windows-2022
             platform: windows64
@@ -59,12 +49,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ python3 ca-certificates curl xvfb xauth
-
-      - name: Install build dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew list cmake  >/dev/null 2>&1 || brew install cmake
-          brew list ninja  >/dev/null 2>&1 || brew install ninja
 
       # Windows: MSVC (Visual Studio 2022), CMake, curl and tar are preinstalled on windows-2022.
       # CEF's own CMake machinery picks the MSVC toolset; no extra packages needed.
@@ -89,7 +73,7 @@ jobs:
 
       # If the tests fail, the job stops here and the release job never runs.
       # Linux runners have no display and CEF needs one to initialise, so hand it a virtual X
-      # server (--auto-servernum picks a free display). macOS/Windows need no wrapper.
+      # server (--auto-servernum picks a free display). Windows needs no wrapper.
       - name: Test
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
@@ -98,8 +82,8 @@ jobs:
             ctest --test-dir build --build-config Release --output-on-failure
           fi
 
-      - name: Package (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist/scripts
           cp build/bin/lucyn   dist/lucyn

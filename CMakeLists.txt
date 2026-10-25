@@ -6,6 +6,10 @@ cmake_minimum_required(VERSION 3.16)
 # CHECK_C_COMPILER_FLAG probes when it is included.
 project(LucyN VERSION 0.1.0 LANGUAGES C CXX)
 
+if(WIN32)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 option(LUCYN_BUILD_TESTS "Build module tests" ON)
 option(LUCYN_BUILD_TOOLS "Build module command-line tools" ON)
 

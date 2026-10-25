@@ -39,6 +39,10 @@
 #include "include/base/cef_callback.h"      // defines base::BindOnce
 #include "include/wrapper/cef_closure_task.h"  // CefPostTask(TID_UI, closure)
 
+#ifdef _WIN32
+    #include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -1049,7 +1053,11 @@ CefRefPtr<CefApp> g_app;  // keep the app alive for the life of CEF
 // executeCefProcess / initCef / shutdownCef / isCefInitialized / cefVersion
 // ---------------------------------------------------------------------------
 int executeCefProcess(int argc, char** argv) {
+#ifdef _WIN32
+    CefMainArgs main_args(GetModuleHandle(nullptr));
+#else
     CefMainArgs main_args(argc, argv);
+#endif
     // Pass our LucynApp so renderer/gpu subprocesses get an app: the render-process
     // handler (OnContextCreated + the "lucyn.eval" V8 evaluator) lives on it, and
     // without it eval/extract/click would have no V8 hook in the subprocess. For the
@@ -1065,7 +1073,11 @@ bool initCef(int argc, char** argv) {
     g_contextReady.store(false);
     g_shuttingDown.store(false);
 
+#ifdef _WIN32
+    CefMainArgs main_args(GetModuleHandle(nullptr));
+#else
     CefMainArgs main_args(argc, argv);
+#endif
     g_app = new LucynApp();
 
     CefSettings settings;
