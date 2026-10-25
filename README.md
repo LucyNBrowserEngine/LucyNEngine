@@ -35,9 +35,17 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-`install.sh` supports Linux (x64, ARM64), macOS (x64, ARM64) and Windows x64; pass `--platform` to
-choose by hand, `--yes` for no questions. To check for a newer CEF later:
-`./scripts/update_cef.sh --check`.
+## Platform support
+
+| Platform | Status |
+|----------|--------|
+| Linux x64 | ✅ Supported |
+| Linux arm64 | ✅ Supported |
+| Windows x64 | 🚧 Builds are currently erroring. We are investigating the cause; Windows is not supported for now. |
+| macOS | ⏳ Planned |
+
+The install script can fetch CEF for additional platforms, but that does not mean LucyN itself is
+supported on them. To check for a newer CEF later: `./scripts/update_cef.sh --check`.
 
 Verify the build:
 
