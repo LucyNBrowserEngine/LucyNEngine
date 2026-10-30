@@ -7,10 +7,13 @@ name: Release
 on:
   push:
     tags:
-      # Lowercase v — the convention the repo actually pushes (v1.0.0). The old
-      # uppercase "V*.*.*" pattern never matched a real tag, so releases silently
-      # never fired.
-      - "v*.*.*"
+      # Capital V on purpose: this is the RETRY channel for the binary release.
+      # The lowercase "v*.*.*" tags trigger npm-publish.yml (JSR), which can only
+      # publish each version once — while this workflow can be re-run or
+      # re-pushed (V1.0.1, V1.0.2, ...) as many times as a build needs without
+      # the package registry complaining that the version already exists.
+      # Ship both tags per release: vX.Y.Z for the package, VX.Y.Z for binaries.
+      - "V*.*.*"
 
 permissions:
   contents: write          # needed to create the release and upload assets

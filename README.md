@@ -90,8 +90,13 @@ downloads still land in `nothing-data/downloads/`.
 
 ### Option A — just run it (prebuilt)
 
-Every `v*.*.*` tag publishes a **self-contained** Linux tarball on the Releases page. It already
-contains the binary *and* the whole Chromium runtime — nothing else to install:
+Every **`V*.*.*`** tag (capital V) publishes a **self-contained** Linux tarball on the Releases
+page. Capital V is deliberate: lowercase `v*.*.*` tags publish the `@lucyn/browser` package to
+JSR, which accepts each version exactly once, while `V*.*.*` only builds binaries — so a broken
+binary build can be re-run or re-pushed as often as it needs without the registry refusing the
+version. Push both tags to ship both artifacts.
+
+The tarball already contains the binary *and* the whole Chromium runtime — nothing else to install:
 
 ```bash
 tar -xzf lucyn-linux-x64.tar.gz
