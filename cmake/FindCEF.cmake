@@ -8,10 +8,11 @@
 #   CEF_ROOT                 - distro root, defaults to <repo>/third_party/cef
 #   libcef_dll_wrapper       - the C++ wrapper library, built from the distro source
 #   lucyn::cef               - INTERFACE target: includes, wrapper + libcef.so + rpath
-#   lucyn_cef_copy_runtime() - copies Release/ + Resources/ next to the built binaries
+#   lucyn_cef_copy_runtime() - copies Release/ + Resources/ into <bin>/cef/ — ONE
+#                              subfolder beside the binaries instead of a pile of
+#                              .so/.pak files loose in the same directory as lucyn
 #                              (CEF needs icudtl.dat, *.pak, locales/ and libcef.so
-#                              next to the executable or it dies with a cryptic
-#                              locale error — SESSION19_CEF_MIGRATION.md "Known hard parts")
+#                              findable; rpath $ORIGIN/cef points the loader there)
 #
 # Usage from the root CMakeLists.txt:
 #   include(cmake/FindCEF.cmake)
@@ -145,12 +146,14 @@ target_compile_definitions(lucyn_cef INTERFACE
 # The library is copied next to the binaries (see lucyn_cef_copy_runtime below), so the
 # binary must find it relative to itself, wherever it is run from.
 if(WIN32)
-  # MSVC has no rpath concept: Windows looks for a DLL beside the .exe.
+  # MSVC has no rpath concept: Windows looks for a DLL beside the .exe —
+  # lucyn_cef_copy_runtime() puts libcef.dll in the cef/ subfolder and main.cpp
+  # adds that folder to PATH for child processes.
 elseif(APPLE)
   # $ORIGIN is an ELF-ism; Mach-O resolves siblings through @loader_path.
-  target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,@loader_path")
+  target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,@loader_path/cef")
 else()
-  target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,$ORIGIN")
+  target_link_options(lucyn_cef INTERFACE "-Wl,-rpath,$ORIGIN/cef")
 endif()
 
 file(STRINGS "${_CEF_ROOT}/include/cef_version.h" _cef_version_line REGEX "^#define CEF_VERSION \"")
@@ -169,23 +172,31 @@ function(lucyn_cef_copy_runtime)
   if(NOT _dst)
     set(_dst "${CMAKE_BINARY_DIR}/bin")
   endif()
-  file(MAKE_DIRECTORY "${_dst}")
+  # Everything CEF needs goes into ONE subfolder — <bin>/cef/ — so the binary's own
+  # directory stays clean: no libcef.so, no *.pak, no locales/ next to `lucyn`.
+  set(_cef_dir "${_dst}/cef")
+  file(MAKE_DIRECTORY "${_cef_dir}")
   # macOS: CEF_BINARY_FILES is empty for the mac distro (cef_variables.cmake only fills it
   # in for Linux and Windows), so copy the whole framework instead — dylib, Libraries/ and
-  # Resources/ (icudtl.dat, *.pak, *.lproj) in one go. CEF resolves the framework next to the
-  # executable through the @loader_path rpath set above.
+  # Resources/ (icudtl.dat, *.pak, *.lproj) in one go. CEF resolves the framework through
+  # the @loader_path/cef rpath set above.
   if(APPLE AND CEF_FRAMEWORK_RELEASE AND IS_DIRECTORY "${CEF_FRAMEWORK_RELEASE}")
-    file(COPY "${CEF_FRAMEWORK_RELEASE}" DESTINATION "${_dst}")
-    return()
+    file(COPY "${CEF_FRAMEWORK_RELEASE}" DESTINATION "${_cef_dir}")
+  else()
+    foreach(_f IN LISTS CEF_BINARY_FILES)
+      if(EXISTS "${CEF_BINARY_DIR_RELEASE}/${_f}")
+        file(COPY "${CEF_BINARY_DIR_RELEASE}/${_f}" DESTINATION "${_cef_dir}")
+      endif()
+    endforeach()
+    foreach(_f IN LISTS CEF_RESOURCE_FILES)
+      if(EXISTS "${CEF_RESOURCE_DIR}/${_f}")
+        file(COPY "${CEF_RESOURCE_DIR}/${_f}" DESTINATION "${_cef_dir}")
+      endif()
+    endforeach()
   endif()
-  foreach(_f IN LISTS CEF_BINARY_FILES)
-    if(EXISTS "${CEF_BINARY_DIR_RELEASE}/${_f}")
-      file(COPY "${CEF_BINARY_DIR_RELEASE}/${_f}" DESTINATION "${_dst}")
-    endif()
-  endforeach()
-  foreach(_f IN LISTS CEF_RESOURCE_FILES)
-    if(EXISTS "${CEF_RESOURCE_DIR}/${_f}")
-      file(COPY "${CEF_RESOURCE_DIR}/${_f}" DESTINATION "${_dst}")
-    endif()
-  endforeach()
+  # Version stamp: initCef() reads this and refuses to run against a libcef from a
+  # DIFFERENT CEF build than the one this binary was compiled with — a mismatch is
+  # exactly what shows up as "stack smashing detected" at run time.
+  file(WRITE "${_cef_dir}/cef-runtime-version.txt"
+       "${_cef_version}\nbuilt_from=${_CEF_ROOT}\n")
 endfunction()

@@ -7,7 +7,10 @@ name: Release
 on:
   push:
     tags:
-      - "V*.*.*"
+      # Lowercase v — the convention the repo actually pushes (v1.0.0). The old
+      # uppercase "V*.*.*" pattern never matched a real tag, so releases silently
+      # never fired.
+      - "v*.*.*"
 
 permissions:
   contents: write          # needed to create the release and upload assets
@@ -42,7 +45,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ python3 ca-certificates curl xvfb xauth
+            cmake ninja-build g++ python3 ca-certificates curl xvfb xauth \
+            libx11-dev
 
       - name: Fetch CEF
         run: ./scripts/install.sh --yes --platform ${{ matrix.platform }}
@@ -60,15 +64,27 @@ jobs:
       - name: Test
         run: xvfb-run --auto-servernum ctest --test-dir build --build-config Release --output-on-failure
 
-      - name: Package
+      - name: "Package (self-contained: binary + Chromium runtime)"
         run: |
+          set -euo pipefail
           mkdir -p dist/scripts
           cp build/bin/lucyn dist/lucyn
+          # lucyn's rpath is $ORIGIN/cef — a binary WITHOUT its cef/ folder cannot
+          # start, so the whole Chromium runtime travels inside the tarball.
+          cp -a build/bin/cef dist/cef
+          # Default adblock filter lists are read from <exeDir>/adblock-filters/.
+          cp -a build/bin/adblock-filters dist/adblock-filters
+          # nothing-data/ is user state (cookies, captures, CEF cache) — never shipped.
+          #
+          # The distro's libcef.so carries debug symbols (1.4 GB). Stripping takes the
+          # tarball from roughly 700 MB to ~150 MB with zero runtime impact.
+          strip --strip-unneeded dist/lucyn dist/cef/libcef.so
           cp scripts/install.sh scripts/update_cef.sh dist/scripts/
           chmod +x dist/lucyn dist/scripts/*.sh
-          tar -czf "${{ matrix.artifact }}" -C dist lucyn scripts
+          tar -czf "${{ matrix.artifact }}" -C dist lucyn cef adblock-filters scripts
           ls -la "${{ matrix.artifact }}"
-          tar -tzf "${{ matrix.artifact }}"
+          echo "tarball contents (top level):"
+          tar -tzf "${{ matrix.artifact }}" | awk -F/ '{print $1}' | sort -u
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4

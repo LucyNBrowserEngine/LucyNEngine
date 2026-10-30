@@ -10,7 +10,14 @@ If a change spans modules, identify each affected module and explain the depende
 
 ## Build and test
 
-Configure and build the repository with:
+A fresh clone has no Chromium in it: fetch the CEF binary distribution first (about 1.5 GB,
+downloaded to `third_party/cef/`, not tracked by git):
+
+```sh
+./scripts/install.sh        # detects your OS/arch, asks to confirm, unpacks into third_party/cef/
+```
+
+Then configure, build, and run the suite:
 
 ```sh
 cmake -S . -B build
@@ -18,13 +25,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-For focused work, build a module independently where supported, for example:
+Nine suites run: `core, search, security, moonbug, deobfuscate, server, cef_host, controller,
+cli_download`. For focused work, run only the ones your change touches:
 
 ```sh
-cmake -S modules/profile -B build-profile
-cmake --build build-profile -j
-ctest --test-dir build-profile --output-on-failure
+ctest --test-dir build -R 'moonbug|server' --output-on-failure
 ```
+
+Changes under `modules/cef_host` deserve a manual pass as well: `./build/bin/lucyn --listen`
+opens the headful listening window — click around and type into a real page. When input looks
+wrong, `LUCYN_DEBUG_INPUT=1 ./build/bin/lucyn --listen` prints the full X11 → CEF key/mouse
+event trace (keysym, windows_key_code, native keycode, text) for every event.
 
 Add tests with the owning module and follow its existing `test_<area>.cpp` and CTest conventions. If you do not run a relevant test or build, say so and explain why. Do not claim a build proves runtime behavior; include integration evidence for changes that cross module boundaries.
 
@@ -37,6 +48,11 @@ Use a focused title and describe:
 3. The behavior or API change and any compatibility impact.
 4. Build/test commands run and their results.
 5. Screenshots, logs, or a small reproducer when they help review.
+
+Commit messages follow Conventional Commits as described in
+[.github/COMMIT_CONVENTION.md](.github/COMMIT_CONVENTION.md) (`feat:`, `fix:`, `docs:`,
+`chore:`, `perf:`), with AI-assisted commits tagged in the subject (e.g.
+`feat: add waitFor timeout [claude]`).
 
 Link a related issue when one exists. Keep unrelated cleanup out of feature PRs. AI-assisted work is welcome; follow [LLM.md](LLM.md), especially its requirement to explain the real reason for the change and verify generated code before submitting it.
 

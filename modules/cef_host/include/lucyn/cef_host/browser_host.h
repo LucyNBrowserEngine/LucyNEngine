@@ -111,7 +111,12 @@ public:
     // in a wait (waitIdle needs that). `requestId` correlates a Start with its
     // Finish. Set once after createInstance(); pass nullptr to stop.
     struct ResourceEvent {
-        enum Phase { Start = 0, Finish = 1 };
+        // Start/Finish come from Chromium's network stack (one pair per resource).
+        // Body is extra: Chromium does not hand the response body of a page load to
+        // the browser process, so cef_host taps what the PAGE reads (fetch/XHR) in
+        // the renderer and forwards it as its own event — the only way to show an
+        // API response's payload in Moonbug without a debug port.
+        enum Phase { Start = 0, Finish = 1, Body = 2 };
         int phase = Start;
         unsigned long long requestId = 0;
         std::string url;       // Finish: final URL after redirects
@@ -124,9 +129,19 @@ public:
         std::string error;                   // empty on success
         std::vector<std::pair<std::string, std::string>> requestHeaders;
         std::vector<std::pair<std::string, std::string>> responseHeaders;
+        // Body phase only:
+        std::string body;           // the response bytes, text/code resources only (capped, see bodyTruncated)
+        bool bodyTruncated = false; // true when the text was cut at the engine's cap
+        std::string contentType;    // response Content-Type (the controller's asset classification; may be empty)
     };
     using ResourceHandler = std::function<void(const ResourceEvent&)>;
     void setResourceHandler(ResourceHandler h);
+
+    // Engine messages meant for a human ("downloaded <file> into ..."). Called
+    // DIRECTLY on the CEF callback thread that produced them — keep the handler
+    // quick and never block. nullptr (the default) drops them.
+    using NoteHandler = std::function<void(const std::string&)>;
+    void setNoteHandler(NoteHandler h);
 
     // ---- Cookies (Session 19 step 9) ------------------------------------------
     // Backed by Chromium's cookie store — the jar a CEF page actually uses (the
@@ -185,6 +200,20 @@ void shutdownCef();
 
 // True between a successful initCef() and shutdownCef().
 bool isCefInitialized();
+
+// Headful mode: show the page in a real window while keeping the off-screen
+// surface (so screenshots and every other command still work). Default OFF —
+// libraries, tests and `lucyn --headless` never open one. Call BEFORE initCef().
+// The window itself is created with the first browser; if the machine has no
+// display it silently stays headless.
+void setPreviewWindow(bool on);
+bool previewWindowEnabled();
+
+// Listen mode (lucyn --listen): inject a small "listen bar" overlay — back
+// button + URL field — into every page, so a human can drive the window by
+// hand (the viewer window itself has no chrome). Call BEFORE initCef().
+void setListenBar(bool on);
+bool listenBarEnabled();
 
 // CEF version string, e.g. "156.0.7+g47dbc1d+chromium-156.0.8078.17".
 std::string cefVersion();

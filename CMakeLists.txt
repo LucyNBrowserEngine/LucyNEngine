@@ -110,29 +110,27 @@ if(LUCYN_MODULE_CONTROLLER
     # and the Controller drives a BrowserInstance (Session 19 steps 5-6).
     target_link_libraries(lucyn PRIVATE lucyn::cef lucyn::cef_host)
     set_target_properties(lucyn PROPERTIES CXX_STANDARD 20)
-    # Deterministic rpath, $ORIGIN FIRST:
-    #   $ORIGIN (= build/bin)  -> where lucyn_cef_copy_runtime put libcef.so +
-    #                             icudtl.dat/*.pak/locales, so CEF resolves its
-    #                             runtime files next to the binary (it looks beside
-    #                             wherever libcef.so loaded from). For a normal
-    #                             run from build/bin this always wins -> ICU works.
-    #   build/bin (fallback)   -> the COMPLETE runtime (libcef.so + icudtl.dat side
-    #                             by side), used when the binary is copied elsewhere
-    #                             (the cli_download test copies lucyn into a temp
-    #                             dir). ICU data must sit next to the loaded
-    #                             libcef.so, so pointing here instead of cef/Release
-    #                             keeps a relocated binary from dying with the
-    #                             cryptic "Invalid file descriptor to ICU data".
+    # Deterministic rpath, the cef/ subfolder FIRST:
+    #   $ORIGIN/cef           -> where lucyn_cef_copy_runtime() puts libcef.so,
+    #                            icudtl.dat, *.pak and locales/, so the binary's own
+    #                            folder holds nothing but `lucyn` (and nothing-data/).
+    #                            For a normal run from build/bin this always wins.
+    #   build/bin/cef         -> the same COMPLETE runtime, used when the binary is
+    #                             copied elsewhere (the cli_download test copies
+    #                             lucyn into a temp dir). ICU data must sit next to
+    #                             the loaded libcef.so, so pointing here keeps a
+    #                             relocated binary from dying with the cryptic
+    #                             "Invalid file descriptor to ICU data".
     #   cef/Release (last)     -> lets the binary at least LOAD if build/bin itself
     #                             is gone.
-    # Set explicitly so we never depend on link order; for a build/bin run $ORIGIN
-    # always wins over both fallbacks. macOS has no $ORIGIN (ELF-ism) — there the
-    # sibling directory is @loader_path, and the "framework" entry is the distro's
-    # Chromium Embedded Framework.framework (libcef IS that framework's binary).
+    # Set explicitly so we never depend on link order; for a build/bin run the
+    # first entry always wins over both fallbacks. macOS has no $ORIGIN (ELF-ism) —
+    # there the sibling directory is @loader_path, and the "framework" entry is the
+    # distro's Chromium Embedded Framework.framework (libcef IS that framework's binary).
     if(APPLE)
-      set(_lucyn_rpath "@loader_path;${CMAKE_RUNTIME_OUTPUT_DIRECTORY};${CEF_BINARY_DIR_RELEASE}")
+      set(_lucyn_rpath "@loader_path/cef;${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/cef;${CEF_BINARY_DIR_RELEASE}")
     else()
-      set(_lucyn_rpath "$ORIGIN;${CMAKE_RUNTIME_OUTPUT_DIRECTORY};${CEF_BINARY_DIR_RELEASE}")
+      set(_lucyn_rpath "$ORIGIN/cef;${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/cef;${CEF_BINARY_DIR_RELEASE}")
     endif()
     set_target_properties(lucyn PROPERTIES
       INSTALL_RPATH "${_lucyn_rpath}"

@@ -63,6 +63,11 @@ struct ControllerOptions {
     // Line-level event emitter (for notes, page errors, future Moonbug events).
     // Called with a complete JSON line, ready to write to stdout.
     std::function<void(const std::string& jsonLine)> onEvent;
+    // When this returns true, unprompted event lines are NOT written to the
+    // output stream (onEvent still sees them). Listen mode uses it so a human's
+    // terminal gets logger-formatted captures instead of raw JSON, while an
+    // attached script — which makes this return false — still receives them.
+    std::function<bool()> suppressEvents;
     // ---- Moonbug (M5) ----------------------------------------------------------------------------
     // Ports for the capture listeners (all bind 127.0.0.1 only). -1 = off, 0 = any free port.
     int moonbugRawPort = -1;      // raw JSON capture stream           (README: 2005)
@@ -77,6 +82,11 @@ struct ControllerOptions {
     // Search defaults from `engine.config.search`; SearXNG needs a user-selected instance.
     std::string searchDefault = "brave";
     std::string searxngUrl;
+    // Headful launch page. When the engine starts a window (lucyn without
+    // --headless) this URL is loaded as soon as Chromium is up, so the window
+    // shows something before the first `visit` arrives — and it is the SAME
+    // browser, so the next visit simply navigates the window there.
+    std::string startUrl;
 
     // Custom in/out streams for testing. Null = use stdin/stdout.
     std::istream* in  = nullptr;

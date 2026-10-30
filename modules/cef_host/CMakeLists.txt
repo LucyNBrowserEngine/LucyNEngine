@@ -34,9 +34,23 @@ if(NOT TARGET lucyn::core)
 endif()
 
 # ---- library ----------------------------------------------------------------
-add_library(lucyn_cef_host STATIC src/browser_host.cpp)
+add_library(lucyn_cef_host STATIC src/browser_host.cpp src/preview_window.cpp)
 add_library(lucyn::cef_host ALIAS lucyn_cef_host)
 target_include_directories(lucyn_cef_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# The headful preview window is X11 on Linux. Optional on purpose: without the
+# headers the same file compiles to no-ops and the engine simply runs headless
+# (that is also what keeps CI and machines without a display green).
+if(UNIX AND NOT APPLE)
+  find_package(X11 QUIET)
+  if(X11_FOUND)
+    target_compile_definitions(lucyn_cef_host PRIVATE LUCYN_HAVE_X11=1)
+    target_include_directories(lucyn_cef_host PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(lucyn_cef_host PRIVATE X11::X11)
+    message(STATUS "lucyn-cef_host: preview window enabled (X11)")
+  else()
+    message(STATUS "lucyn-cef_host: no X11 found - preview window disabled (engine stays headless)")
+  endif()
+endif()
 # PRIVATE, not PUBLIC: cef_host's *implementation* needs C++20 (CEF 156 headers),
 # but its public header (browser_host.h) is CEF-free and C++17-clean. Keeping the
 # feature PRIVATE stops it propagating to consumers — controller/app stay C++17,
@@ -63,12 +77,12 @@ if(LUCYN_BUILD_TOOLS)
   if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
     set_target_properties(lucyn-cef-smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
   endif()
-  # Load libcef.so from next to the binary ($ORIGIN = build/bin), so CEF's
-  # DIR_MODULE == build/bin and it finds icudtl.dat / *.pak / locales there too.
+  # Load libcef.so from next to the binary ($ORIGIN/cef = build/bin/cef), so CEF's
+  # DIR_MODULE is the runtime folder and it finds icudtl.dat / *.pak / locales there.
   # (CMake would otherwise add third_party/cef/Release to the rpath, making CEF
   # look for icudtl.dat in a directory that doesn't contain it -> ICU crash.)
   set_target_properties(lucyn-cef-smoke PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN/cef"
     BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
@@ -79,12 +93,12 @@ if(LUCYN_BUILD_TESTS)
   if(NOT MSVC)
     target_compile_options(test_cef_host PRIVATE -Wall -Wextra)
   endif()
-  # Needs libcef.so + icudtl.dat + *.pak next to it: those live in build/bin
+  # Needs libcef.so + icudtl.dat + *.pak: those live in build/bin/cef
   # (lucyn_cef_copy_runtime). Default RUNTIME_OUTPUT_DIRECTORY is build/bin.
   add_test(NAME cef_host COMMAND test_cef_host)
-  # Same $ORIGIN rpath as the smoke tool: libcef.so + ICU data resolve from build/bin.
+  # Same $ORIGIN/cef rpath as the smoke tool: libcef.so + ICU data resolve from build/bin/cef.
   set_target_properties(test_cef_host PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN/cef"
     BUILD_WITH_INSTALL_RPATH TRUE)
   # CEF init spins up a browser process; give it a little headroom over the
   # default 1500ms before ctest calls it hung.

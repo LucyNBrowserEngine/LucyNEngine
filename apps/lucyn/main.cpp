@@ -9,6 +9,11 @@
 //   lucyn --moonbug                # Moonbug on: raw :2005, NULLBYTE-signed :2006, dashboard :6969 (127.0.0.1 only)
 //   lucyn --dashboard 8080         # just the dashboard, on a port of your choice (also --raw N, --signed N; 0 = any free port)
 //   lucyn --events                 # also stream {"event":"request"...} capture lines on stdout
+//   lucyn --listen                 # LISTEN mode: window + Moonbug (2005/2006/6969) + a URL bar in
+//                                  # every page; every request is logged to this terminal; scripts
+//                                  # attach to the running engine automatically
+//   lucyn --new-instance           # start even if another engine is already running (default:
+//                                  # refuse, so scripts attach to the running one instead)
 //   lucyn --download <url>         # ONE-SHOT: save <url> into nothing-data/downloads/, print the saved path, exit 0 (1 on failure)
 //        [--name f] [--overwrite] [--max-bytes N] [--referer R]
 //   lucyn --version                # print version and exit
@@ -22,7 +27,10 @@
 // CEF (Chromium Embedded Framework) — the engine from Session 19 on. Only used
 // here for the subprocess check; the controller does not talk to CEF yet.
 #include <lucyn/cef_host/browser_host.h>
+#include <lucyn/controller/control_link.h>
 #include <lucyn/controller/controller.h>
+#include <lucyn/logger/logger.h>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -68,6 +76,19 @@ static std::string jsonField(const std::string& line, const std::string& key) {
         } else out += line[p];
     }
     return out;
+}
+
+// Value of a numeric field in one reply/event line ("status":200, "ms":123.4).
+static std::string jsonNumField(const std::string& line, const std::string& key) {
+    const std::string needle = "\"" + key + "\":";
+    size_t p = line.find(needle);
+    if (p == std::string::npos) return "";
+    p += needle.size();
+    size_t e = p;
+    while (e < line.size() && (std::isdigit(static_cast<unsigned char>(line[e])) ||
+                               line[e] == '.' || line[e] == '-'))
+        ++e;
+    return line.substr(p, e - p);
 }
 
 static bool jsonStringAt(const std::string& json, size_t& pos, std::string& out) {
@@ -140,8 +161,8 @@ static int runDownload(lucyn::controller::ControllerOptions opts, const std::str
     std::ostringstream out;
     opts.in  = &in;
     opts.out = &out;
-    opts.onEvent = [](const std::string& line) { std::fprintf(stderr, "[lucyn] %s\n", line.c_str()); };
-    std::fprintf(stderr, "[lucyn] downloading %s\n", url.c_str());
+    opts.onEvent = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
+    lucyn::logger::defaultLogger().info("downloading " + url);
     {
         lucyn::controller::Controller ctrl(opts);
         ctrl.run();
@@ -152,11 +173,11 @@ static int runDownload(lucyn::controller::ControllerOptions opts, const std::str
     while (std::getline(replies, line)) {
         if (line.rfind("{\"id\":1,", 0) != 0) continue;           // skip event lines
         if (line.find("\"ok\":true") != std::string::npos) {
-            std::fprintf(stderr, "[lucyn] saved %s\n", line.c_str());
+            lucyn::logger::defaultLogger().success("saved " + jsonField(line, "path"));
             std::printf("%s\n", jsonField(line, "path").c_str());
             return 0;
         }
-        std::fprintf(stderr, "lucyn: download failed: %s\n", jsonField(line, "error").c_str());
+        lucyn::logger::defaultLogger().error("download failed: " + jsonField(line, "error"));
         return 1;
     }
     std::fprintf(stderr, "lucyn: download failed: no reply from the engine\n");
@@ -179,6 +200,14 @@ static void usage(const char* argv0) {
         "  --dashboard <port> capture dashboard (http://127.0.0.1:<port>/)\n"
         "  --dashboard-file <f>  serve this HTML instead of the built-in dashboard\n"
         "  --events           write a request event per capture to stdout (the nothing-browser client uses this)\n"
+        "  --headless         no window: JSON on stdin/stdout only (tests, CI, servers)\n"
+        "  --listen           listen mode: a window + Moonbug already on (raw 2005, signed 2006,\n"
+        "                     dashboard 6969) + a URL bar in every page; every request the engine\n"
+        "                     makes is logged to this terminal\n"
+        "  --new-instance     start even if another engine is already running (the default is to\n"
+        "                     refuse, so scripts attach to the running engine instead)\n"
+        "  --open <url>       page the window shows at startup\n"
+        "                     (default: https://nothing-browser-docs.pages.dev/)\n"
         "  --config <file>    read engine config JSON (search.default, search.searxng_url)\n"
         "  --download <url>   one-shot: save <url> into nothing-data/downloads/, print the saved path, exit\n"
         "                     (0 = saved, 1 = failed). Extras: --name <file>  --overwrite  --max-bytes <n>  --referer <url>\n"
@@ -206,6 +235,10 @@ int main(int argc, char** argv) {
     opts.settleTimeoutMs = 5000;
     std::string dlUrl, dlName, dlReferer;
     std::string configPath;
+    std::string startUrl = "https://nothing-browser-docs.pages.dev/";
+    bool headless = false;   // headful by default: a human launching lucyn sees a window
+    bool listenMode  = false;   // --listen: headful wiretap + URL bar + attachable
+    bool newInstance = false;   // --new-instance: skip the already-running check
     bool dlOverwrite = false;
     long long dlMax = 0;
 
@@ -215,7 +248,9 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 0;
         } else if (a == "--version") {
-            std::puts("lucyn 0.7.0-m7");
+            // The CEF string (which embeds the Chromium version) matters: the runtime
+            // next to the binary must match it exactly.
+            std::printf("lucyn 0.7.0-m7 (CEF %s)\n", lucyn::cef_host::cefVersion().c_str());
             return 0;
         } else if (a == "--settle" && i + 1 < argc) {
             opts.settleTimeoutMs = std::atoi(argv[++i]);
@@ -242,6 +277,14 @@ int main(int argc, char** argv) {
             opts.dashboardFile = argv[++i];
         } else if (a == "--events") {
             opts.captureEvents = true;
+        } else if (a == "--headless") {
+            headless = true;
+        } else if (a == "--listen") {
+            listenMode = true;
+        } else if (a == "--new-instance") {
+            newInstance = true;
+        } else if (a == "--open" && i + 1 < argc) {
+            startUrl = argv[++i];
         } else if (a == "--config" && i + 1 < argc) {
             configPath = argv[++i];
         } else if (a == "--download" && i + 1 < argc) {
@@ -255,7 +298,7 @@ int main(int argc, char** argv) {
         } else if (a == "--referer" && i + 1 < argc) {
             dlReferer = argv[++i];
         } else {
-            std::fprintf(stderr, "unknown option: %s\n", a.c_str());
+            lucyn::logger::defaultLogger().error(std::string("unknown option: ") + a);
             usage(argv[0]);
             return 1;
         }
@@ -271,24 +314,116 @@ int main(int argc, char** argv) {
     if (!configPath.empty()) {
         std::string error;
         if (!loadConfig(configPath, opts, error)) {
-            std::fprintf(stderr, "lucyn: %s\n", error.c_str());
+            if (error.rfind("cannot read config file", 0) == 0) {
+                // A config that is not there is a WARNING, not a death sentence: the
+                // engine drives a browser perfectly well on its defaults, and dying
+                // here is what made a stale `--config ./engine.json` in an example
+                // look like an engine crash ("lucyn process exited unexpectedly code=1").
+                std::fprintf(stderr, "lucyn: warning: %s (continuing on the defaults)\n", error.c_str());
+            } else {
+                // A config that is there but broken is still a hard error.
+                std::fprintf(stderr, "lucyn: %s\n", error.c_str());
+                return 1;
+            }
+        }
+    }
+
+    // ---- --listen: the wiretap mode ---------------------------------------------------
+    // Headful, Moonbug already on, and the page starts EMPTY: the engine injects
+    // a URL bar into every page (cef_host's listen bar), so a human can type a URL
+    // and click around while every request is logged to this terminal.
+    if (listenMode && dlUrl.empty()) {
+        headless = false;                    // listen is a window by definition
+        startUrl  = "about:blank";           // an empty tab to start from
+        if (opts.moonbugRawPort < 0) opts.moonbugRawPort = 2005;
+        if (opts.nullbytePort   < 0) opts.nullbytePort   = 2006;
+        if (opts.dashboardPort  < 0) opts.dashboardPort  = 6969;
+        opts.captureEvents = true;           // every capture becomes a log line
+        lucyn::cef_host::setListenBar(true);
+    }
+
+    // ---- one engine, many drivers ------------------------------------------------------
+    // The command-loop engine publishes a loopback control endpoint in
+    // nothing-data/engine.json. Check BEFORE anything expensive — definitely
+    // before CEF — whether an engine is already running: starting a second
+    // Chromium against the same cache dir is what surfaced as "broken pipe" /
+    // zygote failures. Scripts attach to the running engine instead (the JS
+    // client does it automatically); a raw second `lucyn` is refused.
+    std::unique_ptr<lucyn::controller::ControlLink> link;
+    if (dlUrl.empty() && !newInstance) {
+        if (auto running = lucyn::controller::findRunningEngine()) {
+            auto& lg = lucyn::logger::defaultLogger();
+            lg.error("an engine is already running (pid " + std::to_string(running->pid) +
+                     ", port " + std::to_string(running->port) + ") - not starting a second one");
+            lg.info("scripts hook into it automatically:  const a = new Lucyn()");
+            lg.info("or pass --new-instance if you really want a second engine");
             return 1;
+        }
+        link = lucyn::controller::ControlLink::start();
+        if (link) {
+            opts.in  = &link->in();
+            opts.out = &link->out();
+        } else {
+            lucyn::logger::defaultLogger().warn("control endpoint unavailable; stdio only");
         }
     }
 
     // Tell the human where the listeners ended up, on STDERR (stdout is the JSON protocol channel).
+    // In listen mode the same events are ALSO rendered as readable log lines, and the raw JSON
+    // itself stays off the terminal until a script attaches (suppressEvents below).
     auto prev = opts.onEvent;
-    opts.onEvent = [prev](const std::string& line) {
+    opts.onEvent = [prev, listenMode](const std::string& line) {
         if (prev) prev(line);
-        if (line.rfind("{\"event\":\"moonbug\"", 0) == 0)
-            std::fprintf(stderr, "[lucyn] moonbug up: %s\n", line.c_str());
+        auto& lg = lucyn::logger::defaultLogger();
+        if (line.rfind("{\"event\":\"moonbug\"", 0) == 0) {
+            lg.info("moonbug up: " + line);
+        } else if (listenMode && line.rfind("{\"event\":\"request\"", 0) == 0) {
+            lg.info("captured: " + jsonField(line, "method") + " " + jsonField(line, "url") +
+                    " -> " + jsonNumField(line, "status") + " (" + jsonNumField(line, "ms") + " ms)");
+        } else if (listenMode && line.rfind("{\"event\":\"note\"", 0) == 0) {
+            lg.info("note: " + jsonField(line, "message"));
+        } else if (listenMode && line.rfind("{\"event\":\"pageError\"", 0) == 0) {
+            lg.warn("page error: " + jsonField(line, "message"));
+        }
     };
+    if (listenMode) {
+        const auto* linkRaw = link.get();
+        opts.suppressEvents = [linkRaw]() { return !linkRaw || !linkRaw->hasAttachedClients(); };
+    }
+    // Headful by default: the window shows whatever the JSON commands do. --headless
+    // (and the one-shot --download, which has no page to show) turns it off.
+    const bool wantWindow = !headless && dlUrl.empty();
+    lucyn::cef_host::setPreviewWindow(wantWindow);
+    if (wantWindow) opts.startUrl = startUrl;
+
     // Session 19: initialise Chromium BEFORE any command runs — the one-shot
     // `--download` path fetches through Chromium's network stack now too (the
     // subprocess check already ran at the top of main). On failure we keep going;
     // engine commands then report "no browser instance (CEF not initialised)".
-    if (!lucyn::cef_host::initCef(argc, argv))
-        std::fprintf(stderr, "[lucyn] CEF init failed; engine commands will fail\n");
+    auto& log = lucyn::logger::defaultLogger();
+    log.setThreshold(lucyn::logger::Threshold::info);   // the launch banner is never a secret
+    const bool cefUp = lucyn::cef_host::initCef(argc, argv);
+    if (!cefUp)
+        log.error("CEF init failed; engine commands will fail");
+
+    // The launch banner. STDERR only — stdout is the JSON protocol channel.
+    if (cefUp && dlUrl.empty()) {
+        if (listenMode) {
+            log.success("engine is up and running in listen mode - moonbug is listening");
+            log.info("raw stream ws://127.0.0.1:2005/stream  -  signed :2006  -  dashboard http://127.0.0.1:6969/");
+            log.info("the window opens on an empty tab: type a URL in the bar, click around,");
+            log.info("and watch every request the engine makes scroll by on this terminal");
+        } else if (wantWindow) {
+            log.success("engine is up and running — window opens on " + startUrl +
+                        " and follows every command you send");
+        } else {
+            log.success("engine is up and running in headless mode — no window, JSON on stdin/stdout");
+        }
+        log.info("write a JS/TS file to control the browser:  npx jsr add @lucyn/browser");
+        if (link)
+            log.info("control endpoint up on 127.0.0.1:" + std::to_string(link->port()) +
+                     " - a running script attaches to it instead of starting a second engine");
+    }
 
     // One-shot --download: run that single command, then stop CEF and exit.
     if (!dlUrl.empty()) {
@@ -304,6 +439,9 @@ int main(int argc, char** argv) {
         lucyn::controller::Controller ctrl(opts);
         rc = ctrl.run();
     }
+    // Stop accepting attachments and remove engine.json BEFORE CEF goes down,
+    // so the next script sees a clean slate.
+    link.reset();
     // The Controller (and its BrowserInstance) is gone now; stop CEF's UI thread
     // cleanly before the immediate _Exit below.
     lucyn::cef_host::shutdownCef();

@@ -30,6 +30,7 @@ endif()
 # ---- library ----------------------------------------------------------------
 add_library(lucyn_controller STATIC
     src/controller.cpp
+    src/control_link.cpp
 )
 add_library(lucyn::controller ALIAS lucyn_controller)
 

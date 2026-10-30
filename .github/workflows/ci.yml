@@ -28,7 +28,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ python3 ca-certificates curl xvfb xauth
+            cmake ninja-build g++ python3 ca-certificates curl xvfb xauth \
+            libx11-dev
 
       # The CEF distro is ~663 MB — the single biggest CI cost. Resolve the version the
       # index currently calls "latest stable" and key the cache on it, so the cache is

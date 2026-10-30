@@ -16,17 +16,23 @@
 
 #include "lucyn/cef_host/browser_host.h"
 
+#include "lucyn/core/assets.h"     // isTextAsset(): which responses are worth buffering
+#include "preview_window.h"       // the headful preview window (headless = no-op)
+
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
 #include "include/cef_cookie.h"
 #include "include/cef_display_handler.h"
+#include "include/cef_download_handler.h"   // page-triggered downloads -> nothing-data/downloads
 #include "include/cef_load_handler.h"
+#include "include/cef_navigation_entry.h"   // title of the navigation that is visible
 #include "include/cef_process_message.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_render_process_handler.h"
 #include "include/cef_request_handler.h"
+#include "include/cef_response_filter.h"   // per-resource response body capture (Moonbug bodies)
 #include "include/cef_request_context.h"
 #include "include/cef_resource_request_handler.h"
 #include "include/cef_string_visitor.h"
@@ -34,6 +40,7 @@
 #include "include/cef_task.h"
 #include "include/cef_v8.h"
 #include "include/cef_version.h"
+#include "include/cef_version_info.h"  // cef_version_info(): run-time version of the libcef we loaded
 #include "include/internal/cef_types.h"
 #include "include/internal/cef_time.h"      // cef_time_from_timet / _to_basetime
 #include "include/base/cef_callback.h"      // defines base::BindOnce
@@ -49,8 +56,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -192,6 +201,10 @@ struct SharedState {
     // in a wait. Guarded by mu; set once from setResourceHandler().
     std::function<void(const BrowserInstance::ResourceEvent&)> resourceHandler;  // guarded by mu
 
+    // Engine notes ("downloaded X"): same rules as resourceHandler — called
+    // DIRECTLY on the CEF thread that produced them. Guarded by mu.
+    std::function<void(const std::string&)> noteHandler;  // guarded by mu
+
     // Latest painted frame, BGRA, guarded by paintMu. Screenshot reads it.
     std::mutex paintMu;
     std::vector<unsigned char> pixels;
@@ -312,16 +325,142 @@ std::vector<std::pair<std::string, std::string>> headerList(
 }
 
 // ---------------------------------------------------------------------------
+// LucynBodyFilter — sees the response body of EVERY text/code resource, in the
+// browser process, on the IO thread.
+//
+// Chromium does not hand the browser process response bytes on its own, but CEF
+// lets us install a CefResponseFilter on the response stream (see
+// GetResourceResponseFilter below). We copy the bytes through untouched — the
+// page must read exactly what the server sent — while keeping our own copy,
+// capped at kBodyCaptureCap. OnResourceLoadComplete flushes the copy into a
+// ResourceEvent::Body, which is what fills Moonbug's `body` for documents,
+// scripts, stylesheets and XHR alike.
+// ---------------------------------------------------------------------------
+
+// Per-response capture cap. Deliberately above Moonbug's display cap: artifacts
+// are written from this buffer, so a fat minified bundle has to fit; the
+// dashboard trims for display on its own.
+constexpr std::size_t kBodyCaptureCap = 4u * 1024u * 1024u;
+
+class LucynBodyFilter : public CefResponseFilter {
+public:
+    LucynBodyFilter(std::shared_ptr<SharedState> state, unsigned long long requestId,
+                    std::string url, std::string method, std::string contentType)
+        : state_(std::move(state))
+        , requestId_(requestId)
+        , url_(std::move(url))
+        , method_(std::move(method))
+        , contentType_(std::move(contentType)) {}
+
+    bool InitFilter() override { return true; }
+
+    FilterStatus Filter(void* data_in,
+                        size_t data_in_size,
+                        size_t& data_in_read,
+                        void* data_out,
+                        size_t data_out_size,
+                        size_t& data_out_written) override {
+        // Same contract as CEF's own PassThruResponseFilter: hand the bytes
+        // straight through (data_in_read/data_out_written as a copy) and keep a
+        // second copy for Moonbug. An empty call is CEF's end-of-response signal.
+        data_out_written = std::min(data_in_size, data_out_size);
+        data_in_read = data_out_written;
+        if (data_out_written > 0 && data_in) {
+            std::memcpy(data_out, data_in, data_out_written);
+            if (buf_.size() < kBodyCaptureCap) {
+                const std::size_t room = kBodyCaptureCap - buf_.size();
+                const std::size_t take = std::min<std::size_t>(room, data_out_written);
+                buf_.append(static_cast<const char*>(data_in), take);
+                if (take < data_out_written) truncated_ = true;
+            } else {
+                truncated_ = true;
+            }
+        }
+        if (data_in_size == 0) emit();
+        return RESPONSE_FILTER_DONE;
+    }
+
+    // Called from OnResourceLoadComplete (same IO thread) — the guaranteed end of
+    // the response, whether or not CEF made the empty final call. Idempotent.
+    void flush() { emit(); }
+
+private:
+    void emit() {
+        if (emitted_) return;
+        emitted_ = true;
+        if (buf_.empty()) return;   // 304/HEAD/empty body: nothing to say
+        std::function<void(const BrowserInstance::ResourceEvent&)> h;
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            h = state_->resourceHandler;
+        }
+        if (!h) return;
+        BrowserInstance::ResourceEvent ev;
+        ev.phase         = BrowserInstance::ResourceEvent::Body;
+        ev.requestId     = requestId_;
+        ev.url           = url_;
+        ev.method        = method_;
+        ev.contentType   = contentType_;
+        ev.bytes         = static_cast<long long>(buf_.size());
+        ev.body          = std::move(buf_);
+        ev.bodyTruncated = truncated_;
+        h(ev);  // directly on the IO thread, like Start/Finish
+    }
+
+    std::shared_ptr<SharedState> state_;
+    unsigned long long requestId_;
+    std::string url_;
+    std::string method_;
+    std::string contentType_;
+    std::string buf_;
+    bool truncated_ = false;
+    bool emitted_   = false;
+
+    IMPLEMENT_REFCOUNTING(LucynBodyFilter);
+    DISALLOW_COPY_AND_ASSIGN(LucynBodyFilter);
+};
+
+// ---------------------------------------------------------------------------
 // LucynResourceRequestHandler — feeds the controller's Moonbug tap (step 8).
-// Reports the start and completion of every resource CEF loads. Runs on CEF's IO
-// thread and invokes the user's handler DIRECTLY (SharedState::resourceHandler)
-// — not via pump() — so a capture lands even while the caller blocks in a wait
-// (waitIdle needs a live feed).
+// Reports the start and completion of every resource CEF loads, and installs
+// LucynBodyFilter so the body of every text/code response arrives too.
 // ---------------------------------------------------------------------------
 class LucynResourceRequestHandler : public CefResourceRequestHandler {
 public:
     explicit LucynResourceRequestHandler(std::shared_ptr<SharedState> state)
         : state_(std::move(state)) {}
+
+    // Body capture: called on the IO thread just before the response streams to
+    // the renderer. We buffer only what is worth keeping as text/code — images,
+    // fonts and media get no filter at all (zero overhead for them) — and register
+    // it so OnResourceLoadComplete can flush it into a Body event.
+    CefRefPtr<CefResponseFilter> GetResourceResponseFilter(CefRefPtr<CefBrowser>,
+                                                           CefRefPtr<CefFrame>,
+                                                           CefRefPtr<CefRequest> request,
+                                                           CefRefPtr<CefResponse> response) override {
+        const std::string reqUrl = request->GetURL().ToString();
+        if (core::isPseudoUrl(reqUrl)) return nullptr;
+        const std::string respUrl =
+            response ? response->GetURL().ToString() : std::string();
+        const std::string finalUrl = respUrl.empty() ? reqUrl : respUrl;
+        std::string ct;   // this CEF exposes headers only via GetHeaderMap
+        if (response) {
+            CefResponse::HeaderMap hm;
+            response->GetHeaderMap(hm);
+            for (const auto& kv : hm) {
+                std::string key = kv.first.ToString();
+                for (char& ch : key)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                if (key == "content-type") { ct = kv.second.ToString(); break; }
+            }
+        }
+        if (!core::isTextAsset(finalUrl, ct)) return nullptr;  // binary: never buffered
+        CefRefPtr<LucynBodyFilter> filter =
+            new LucynBodyFilter(state_, request->GetIdentifier(), finalUrl,
+                                request->GetMethod().ToString(), ct);
+        filters_[request->GetIdentifier()] = filter;  // IO thread only: no lock
+        return filter;
+    }
 
     ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser>,
                                       CefRefPtr<CefFrame>,
@@ -352,6 +491,15 @@ public:
                                 CefRefPtr<CefResponse> response,
                                 URLRequestStatus status,
                                 int64_t received_content_length) override {
+        // Flush the response body BEFORE the Finish event goes out: the controller
+        // parks a Body that precedes its Finish and merges it into the capture.
+        {
+            auto it = filters_.find(request->GetIdentifier());
+            if (it != filters_.end()) {
+                it->second->flush();
+                filters_.erase(it);
+            }
+        }
         std::function<void(const BrowserInstance::ResourceEvent&)> h;
         {
             std::lock_guard<std::mutex> lock(state_->mu);
@@ -385,8 +533,241 @@ public:
 
 private:
     std::shared_ptr<SharedState> state_;
+    // requestId -> the body filter installed for that response. IO thread only.
+    std::map<unsigned long long, CefRefPtr<LucynBodyFilter>> filters_;
     IMPLEMENT_REFCOUNTING(LucynResourceRequestHandler);
     DISALLOW_COPY_AND_ASSIGN(LucynResourceRequestHandler);
+};
+
+// ---------------------------------------------------------------------------
+// Response bodies (Moonbug's `body` field) — two paths, complementary.
+//
+// PRIMARY: LucynBodyFilter above. Chromium never volunteers response bytes to
+// the browser process, but a CefResponseFilter sits on the response stream, so
+// every text/code resource — documents, scripts, stylesheets, JSON — arrives as
+// a ResourceEvent::Body with its Content-Type.
+//
+// FALLBACK: the renderer's page-side tap (kNetTapJs, below). It reports what a
+// page's own fetch()/XHR read as a "lucyn.net.body" process message. If both
+// paths see the same response the controller drops the identical duplicate, so
+// a capture ends up with one body either way.
+// ---------------------------------------------------------------------------
+
+class LucynNetTapHandler : public CefV8Handler {
+public:
+    LucynNetTapHandler() = default;   // DISALLOW_COPY_AND_ASSIGN below suppresses the implicit one
+
+    bool Execute(const CefString& name,
+                 CefRefPtr<CefV8Value>,                 // object (unused)
+                 const CefV8ValueList& arguments,
+                 CefRefPtr<CefV8Value>& retval,
+                 CefString&) override {                 // exception (unused)
+        retval = CefV8Value::CreateBool(false);
+        if (name != "lucynNetTap" || arguments.size() < 6) return true;
+        CefRefPtr<CefV8Context> ctx = CefV8Context::GetCurrentContext();
+        CefRefPtr<CefFrame> frame = ctx ? ctx->GetFrame() : nullptr;
+        if (!frame) return true;
+
+        auto str = [&](size_t i) {
+            return arguments[i]->IsString() ? arguments[i]->GetStringValue() : CefString();
+        };
+        CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("lucyn.net.body");
+        CefRefPtr<CefListValue> a = msg->GetArgumentList();
+        a->SetString(0, str(0));                                             // url (final)
+        a->SetString(1, str(1));                                             // method
+        a->SetInt(2, arguments[2]->IsInt() ? arguments[2]->GetIntValue() : 0);      // status
+        a->SetString(3, str(3));                                             // body text
+        const bool numeric = arguments[4]->IsInt() || arguments[4]->IsUInt() || arguments[4]->IsDouble();
+        a->SetDouble(4, numeric ? arguments[4]->GetDoubleValue() : 0);  // bytes read
+        a->SetInt(5, arguments[5]->IsBool() && arguments[5]->GetBoolValue() ? 1 : 0);    // truncated
+        frame->SendProcessMessage(PID_BROWSER, msg);
+        retval = CefV8Value::CreateBool(true);
+        return true;
+    }
+
+private:
+    IMPLEMENT_REFCOUNTING(LucynNetTapHandler);
+    DISALLOW_COPY_AND_ASSIGN(LucynNetTapHandler);
+};
+
+// The page-side tap. Runs in every frame, first thing after the context is
+// created (before any page script), and reports the text a fetch()/XHR produced
+// — capped, text-ish responses only. It must never change what the page sees:
+// every wrapper is transparent apart from the extra read of a cloned response.
+static const char kNetTapJs[] = R"LUCYNJS(
+(function () {
+  if (window.__lucynNetTap) return;
+  window.__lucynNetTap = 1;
+  var MAX = 512 * 1024;          // bytes of body text reported per response
+  var MAX_LEN = 2 * 1024 * 1024; // skip reading bodies bigger than this
+  function tap(url, method, status, body, bytes, truncated) {
+    try {
+      window.lucynNetTap(String(url || ""), String(method || "GET"), status | 0,
+                         String(body || ""), bytes | 0, truncated ? 1 : 0);
+    } catch (e) {}
+  }
+  function textish(ct) {
+    ct = (ct || "").toLowerCase();
+    if (!ct) return true;
+    if (/^(image|video|audio|font)\//.test(ct)) return false;
+    if (/(javascript|ecmascript|css|wasm|octet-stream|zip|pdf|font)/.test(ct)) return false;
+    return true;
+  }
+  function tooBig(res) {
+    try {
+      var cl = res.headers && res.headers.get ? res.headers.get("content-length") : null;
+      if (cl && +cl > MAX_LEN) return true;
+    } catch (e) {}
+    return false;
+  }
+  function clip(t) { return t.length > MAX ? t.slice(0, MAX) : t; }
+
+  var origFetch = window.fetch;
+  if (typeof origFetch === "function") {
+    window.fetch = function (input, init) {
+      var url = "", method = "GET";
+      try {
+        url = typeof input === "string" ? input : (input && input.url) || "";
+        method = (init && init.method) || (input && input.method) || "GET";
+      } catch (e) {}
+      var p;
+      try { p = origFetch.apply(this, arguments); } catch (e) { throw e; }
+      if (!p || typeof p.then !== "function") return p;
+      return p.then(function (res) {
+        try {
+          if (res && res.headers && textish(res.headers.get("content-type")) && !tooBig(res)) {
+            var u = res.url || url, m = method, st = res.status;
+            res.clone().text().then(function (t) {
+              tap(u, m, st, clip(t), t.length, t.length > MAX);
+            }, function () {});
+          }
+        } catch (e) {}
+        return res;
+      });
+    };
+  }
+
+  var X = window.XMLHttpRequest;
+  if (X && X.prototype && X.prototype.open && X.prototype.send) {
+    var origOpen = X.prototype.open, origSend = X.prototype.send;
+    X.prototype.open = function (method, url) {
+      this.__lucynMethod = method;
+      this.__lucynUrl = url;
+      return origOpen.apply(this, arguments);
+    };
+    X.prototype.send = function () {
+      var self = this;
+      self.addEventListener("loadend", function () {
+        try {
+          if (!self.status) return;                       // network error / abort
+          var ct = self.getResponseHeader("content-type") || "";
+          if (!textish(ct)) return;
+          var len = +(self.getResponseHeader("content-length") || 0);
+          if (len > MAX_LEN) return;
+          var rt = self.responseType || "", t;
+          if (!rt || rt === "text") t = self.responseText || "";
+          else if (rt === "json") t = JSON.stringify(self.response);
+          else return;
+          var u = self.responseURL || self.__lucynUrl || "";
+          tap(u, self.__lucynMethod || "GET", self.status, clip(t), t.length, t.length > MAX);
+        } catch (e) {}
+      });
+      return origSend.apply(this, arguments);
+    };
+  }
+})();
+)LUCYNJS";
+
+// ---------------------------------------------------------------------------
+// LucynDownloadHandler — page-triggered downloads (alt+click, or a response with
+// `Content-Disposition: attachment`). With no handler CEF leaves these to
+// Chromium's default handling, which writes the file into the user's Downloads
+// folder (Chrome style) — the "why is there a .txt in my folder" surprise. Every
+// download is instead routed into <nothing-data>/downloads/, the same folder the
+// `download` command uses, and reported as a note.
+// ---------------------------------------------------------------------------
+class LucynDownloadHandler : public CefDownloadHandler {
+public:
+    explicit LucynDownloadHandler(std::shared_ptr<SharedState> state) : state_(std::move(state)) {}
+
+    bool OnBeforeDownload(CefRefPtr<CefBrowser>,
+                          CefRefPtr<CefDownloadItem> item,
+                          const CefString& suggested_name,
+                          CefRefPtr<CefBeforeDownloadCallback> callback) override {
+        const std::string dir = core::dataDir("downloads");   // creates the folder
+        const std::string name = safeName(suggested_name.ToString(), item);
+        const std::string path = dir.empty() ? std::string() : uniquePath(dir, name);
+        note("download: " + (item ? item->GetURL().ToString() : std::string()) +
+             " -> " + (path.empty() ? name : path));
+        if (callback && !path.empty()) callback->Continue(path, /*show_dialog=*/false);
+        return true;
+    }
+
+    void OnDownloadUpdated(CefRefPtr<CefBrowser>,
+                           CefRefPtr<CefDownloadItem> item,
+                           CefRefPtr<CefDownloadItemCallback> callback) override {
+        if (!item || !item->IsValid()) return;
+        if (item->IsComplete()) {
+            note("downloaded " + item->GetFullPath().ToString() + " (" +
+                 std::to_string(item->GetTotalBytes()) + " bytes)");
+        } else if (item->IsCanceled() || item->IsInterrupted()) {
+            note("download failed: " + item->GetURL().ToString());
+            if (callback) callback->Cancel();
+        }
+    }
+
+private:
+    // A file name the filesystem will accept and that cannot escape the folder:
+    // the last path segment, with separators, control characters and the usual
+    // suspects replaced. Falls back to the URL's last segment, then to "file".
+    static std::string safeName(std::string name, CefRefPtr<CefDownloadItem> item) {
+        auto cut = [](std::string s) {
+            size_t p = s.find_last_of("/\\");
+            if (p != std::string::npos) s = s.substr(p + 1);
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                unsigned char u = static_cast<unsigned char>(c);
+                out += (u < 0x20 || u == 0x7f || c == ':' || c == '*' || c == '?' ||
+                        c == '"' || c == '<' || c == '>' || c == '|') ? '_' : c;
+            }
+            while (!out.empty() && (out.back() == ' ' || out.back() == '.')) out.pop_back();
+            return out;
+        };
+        std::string s = cut(name);
+        if (s.empty() && item) s = cut(item->GetURL().ToString());
+        return s.empty() ? "file" : s;
+    }
+
+    // <dir>/<name>, or "<stem> (1).<ext>", "(2)", ... — never overwrite what is there.
+    static std::string uniquePath(const std::string& dir, const std::string& name) {
+        namespace fs = std::filesystem;
+        const fs::path base(dir);
+        std::error_code ec;
+        const fs::path first = base / name;
+        if (!fs::exists(first, ec)) return first.string();
+        std::string stem = name, ext;
+        const size_t dot = name.rfind('.');
+        if (dot != std::string::npos && dot > 0) { stem = name.substr(0, dot); ext = name.substr(dot); }
+        for (int n = 1; n < 100000; ++n) {
+            const fs::path cand = base / (stem + " (" + std::to_string(n) + ")" + ext);
+            if (!fs::exists(cand, ec)) return cand.string();
+        }
+        return first.string();
+    }
+
+    void note(const std::string& msg) {
+        std::function<void(const std::string&)> h;
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            h = state_->noteHandler;
+        }
+        if (h) h(msg);
+    }
+
+    std::shared_ptr<SharedState> state_;
+    IMPLEMENT_REFCOUNTING(LucynDownloadHandler);
+    DISALLOW_COPY_AND_ASSIGN(LucynDownloadHandler);
 };
 
 // ---------------------------------------------------------------------------
@@ -502,6 +883,74 @@ void StartFetchTask(CefRefPtr<LucynFetchClient> client, const std::string& url, 
     client->attach(r);
 }
 
+// "https://example.com/" and "https://example.com" are the same page; title
+// matching must not care about the trailing slash a redirect adds.
+static std::string trimTrailingSlash(std::string u) {
+    while (u.size() > 1 && u.back() == '/') u.pop_back();
+    return u;
+}
+
+// ---------------------------------------------------------------------------
+// Listen mode (lucyn --listen): the URL bar the PAGE draws.
+// The viewer window is an off-screen frame in an X11 window: no toolbar, no
+// address field. So --listen injects this overlay into every page — type a
+// URL, press Enter, click around; Moonbug records every request. Declared here
+// because LucynClient::OnLoadEnd (below) injects it.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_listenBar{false};   // read here, set by setListenBar() below
+
+static const char kListenBarJs[] = R"LUCYNJS(
+(function () {
+  if (window.__lucynListenBar) return;
+  window.__lucynListenBar = 1;
+  function build() {
+    if (document.getElementById("lucyn-listen-bar")) return;
+    var bar = document.createElement("div");
+    bar.id = "lucyn-listen-bar";
+    bar.style.cssText =
+      "position:fixed;top:0;left:0;right:0;height:34px;z-index:2147483647;" +
+      "display:flex;align-items:center;gap:8px;padding:0 10px;" +
+      "background:#0e1116;border-bottom:1px solid #2b3240;" +
+      "font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#c9d4e3;" +
+      "box-shadow:0 1px 6px rgba(0,0,0,.45);box-sizing:border-box;";
+    var tag = document.createElement("span");
+    tag.textContent = "LUCYN LISTEN";
+    tag.style.cssText = "color:#3fb950;font-weight:700;letter-spacing:.06em;white-space:nowrap;";
+    var back = document.createElement("button");
+    back.type = "button";
+    back.textContent = "\u2190";
+    back.title = "back";
+    back.style.cssText = "background:#1b2230;color:#c9d4e3;border:1px solid #2b3240;" +
+      "border-radius:4px;padding:2px 9px;cursor:pointer;font:inherit;";
+    back.onclick = function () { history.back(); };
+    var input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "type a URL and press Enter - every request is captured";
+    input.style.cssText = "flex:1;min-width:0;background:#151b24;color:#e6edf3;" +
+      "border:1px solid #2b3240;border-radius:4px;padding:4px 9px;font:inherit;outline:none;";
+    var sync = function () { input.value = location.href; };
+    input.addEventListener("focus", function () { sync(); input.select(); });
+    input.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter") return;
+      var v = (input.value || "").trim();
+      if (!v) return;
+      var u;
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) u = v;
+      else if (/^[\w.-]+\.[a-z]{2,}([\/?#].*)?$/i.test(v)) u = "https://" + v;
+      else u = "https://duckduckgo.com/?q=" + encodeURIComponent(v);
+      location.href = u;
+    });
+    bar.appendChild(tag);
+    bar.appendChild(back);
+    bar.appendChild(input);
+    sync();
+    (document.body || document.documentElement).appendChild(bar);
+  }
+  build();
+  setInterval(build, 2000);   // re-add it if the page's own scripts remove it
+})();
+)LUCYNJS";
+
 // ---------------------------------------------------------------------------
 // LucynClient — one browser's CEF client. Implements the handler interfaces the
 // engine calls back into. Holds a shared_ptr to SharedState, never a raw Impl*.
@@ -510,10 +959,12 @@ class LucynClient : public CefClient,
                     public CefLoadHandler,
                     public CefDisplayHandler,
                     public CefRenderHandler,
-                    public CefRequestHandler {
+                    public CefRequestHandler,
+                    public CefDownloadHandler {
 public:
     explicit LucynClient(std::shared_ptr<SharedState> state) : state_(std::move(state)) {
         resourceReq_ = new LucynResourceRequestHandler(state_);
+        downloadHandler_ = new LucynDownloadHandler(state_);
     }
 
     // -- CefClient -----------------------------------------------------------
@@ -521,6 +972,9 @@ public:
     CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
     CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
     CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+    // Without this CEF hands page-triggered downloads to Chromium's default
+    // handling (a file dropped in ~/Downloads or the working directory).
+    CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return downloadHandler_; }
 
     // Provide the resource observer that drives Moonbug. Returning a non-null
     // handler here is what makes OnBeforeResourceLoad / OnResourceLoadComplete fire.
@@ -556,6 +1010,12 @@ public:
             state_->pixH = height;
         }
 
+        // Headful preview: hand the very same frame to the window (a memcpy into
+        // a slot, so the window can never slow Chromium's paint thread down).
+        // Screenshot capture stays with ScreenshotDeadlineTask below — this is a
+        // viewer, not a second consumer of the pixels.
+        preview::present(buffer, width, height);
+
         // Screenshot capture is handled entirely by the delayed ScreenshotDeadlineTask
         // (which encodes the latest frame after the settle window). We only store the
         // latest pixels here, and deliberately do NOT re-invalidate: doing so would
@@ -564,9 +1024,22 @@ public:
     }
 
     // -- CefDisplayHandler ---------------------------------------------------
-    void OnTitleChange(CefRefPtr<CefBrowser>, const CefString& title) override {
-        std::lock_guard<std::mutex> lock(state_->mu);
-        state_->lastTitle = title.ToString();
+    void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) override {
+        const std::string t = title.ToString();
+        // A navigation that visit() has already superseded can still deliver its
+        // title (the headful start page keeps loading while the first visit runs).
+        // Compare URLs so a stale title can never overwrite the current page's.
+        const std::string pageUrl =
+            browser && browser->GetMainFrame() ? browser->GetMainFrame()->GetURL().ToString() : std::string();
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            if (!state_->currentUrl.empty() && !pageUrl.empty() &&
+                trimTrailingSlash(pageUrl) != trimTrailingSlash(state_->currentUrl)) {
+                return;   // title of a page we have navigated away from
+            }
+            state_->lastTitle = t;
+        }
+        preview::setTitle(t.empty() ? "LucyN" : t + " - LucyN");
     }
 
     // -- CefLoadHandler ------------------------------------------------------
@@ -588,9 +1061,24 @@ public:
             cb                 = state_->loadCb;
             state_->loadCb     = nullptr;
         }
+        // Prefer the title of the navigation that is actually visible right now:
+        // state->lastTitle can still hold a stale one when two navigations overlap
+        // (headful start page + the first visit in the same instant).
+        if (browser && browser->GetHost()) {
+            if (CefRefPtr<CefNavigationEntry> entry = browser->GetHost()->GetVisibleNavigationEntry()) {
+                const std::string t = entry->GetTitle().ToString();
+                if (!t.empty()) title = t;
+            }
+        }
         if (cb) {
             // Fire the user callback on the caller's thread via pump().
             state_->post([cb, status, title]() { cb(true, status, title, std::string()); });
+        }
+        // Listen mode: draw the URL bar into the page that just loaded
+        // (about:blank first, then every navigation). ExecuteJavaScript from
+        // the browser process is not subject to the page's CSP.
+        if (g_listenBar.load() && browser && browser->GetMainFrame()) {
+            browser->GetMainFrame()->ExecuteJavaScript(kListenBarJs, url, 0);
         }
     }
 
@@ -614,12 +1102,34 @@ public:
         }
     }
 
-    // -- CefClient: eval results coming back from the renderer -------------
+    // -- CefClient: messages coming up from the renderer ---------------------
     bool OnProcessMessageReceived(CefRefPtr<CefBrowser>,
                                   CefRefPtr<CefFrame>,
                                   CefProcessId,
                                   CefRefPtr<CefProcessMessage> message) override {
-        if (message->GetName() != "lucyn.eval.result") return false;
+        const std::string name = message->GetName().ToString();
+        if (name == "lucyn.net.body") {
+            // The page read a response body (kNetTapJs): hand it to the controller's
+            // Moonbug tap as a Body event. Direct call, exactly like the resource
+            // events — the handler only takes its own locks.
+            CefRefPtr<CefListValue> a = message->GetArgumentList();
+            BrowserInstance::ResourceEvent ev;
+            ev.phase         = BrowserInstance::ResourceEvent::Body;
+            ev.url           = a->GetString(0).ToString();
+            ev.method        = a->GetString(1).ToString();
+            ev.status        = a->GetInt(2);
+            ev.body          = a->GetString(3).ToString();
+            ev.bytes         = static_cast<long long>(a->GetDouble(4));
+            ev.bodyTruncated = a->GetInt(5) != 0;
+            std::function<void(const BrowserInstance::ResourceEvent&)> h;
+            {
+                std::lock_guard<std::mutex> lock(state_->mu);
+                h = state_->resourceHandler;
+            }
+            if (h) h(ev);
+            return true;
+        }
+        if (name != "lucyn.eval.result") return false;
         CefRefPtr<CefListValue> args = message->GetArgumentList();
         const int reqId = args->GetInt(0);
         const bool ok   = args->GetInt(1) != 0;
@@ -645,6 +1155,7 @@ public:
 private:
     std::shared_ptr<SharedState> state_;
     CefRefPtr<LucynResourceRequestHandler> resourceReq_;  // returned to CEF once, reused
+    CefRefPtr<LucynDownloadHandler> downloadHandler_;     // returned to CEF once, reused
 
     // CefBaseRefCounted
     IMPLEMENT_REFCOUNTING(LucynClient);
@@ -670,6 +1181,12 @@ public:
     // -- CefApp --------------------------------------------------------------
     void OnBeforeCommandLineProcessing(const CefString&,
                                        CefRefPtr<CefCommandLine> command_line) override {
+        // Our own `--headless` means "do not open a window". Chromium also has a
+        // --headless switch, and letting it through swaps the compositor for the
+        // headless shell: our OnPaint frames never arrive and every screenshot
+        // dies with "no frame captured yet". We already render off-screen (ozone
+        // platform=headless below), so Chromium's flag is not wanted.
+        command_line->RemoveSwitch("headless");
         // Headless scraping: no GPU, no sandbox friction, tiny footprint.
         // See engine-history/SESSION19_CEF_MIGRATION.md "CEF headless flags for Linux".
         command_line->AppendSwitch("disable-gpu");
@@ -713,6 +1230,27 @@ public:
                           CefRefPtr<CefFrame> frame,
                           CefRefPtr<CefV8Context> context) override {
         if (frame->IsMain()) contexts_[browser->GetIdentifier()] = context;
+        installNetTap(frame, context);
+    }
+
+    // Response-body tap: publish window.lucynNetTap (native sink) and run the
+    // fetch/XHR wrapper in a brand-new context, before any page script runs.
+    // Done here rather than from the browser process so it lands at document
+    // start; native Eval is v8::Script::Compile and ignores the page's CSP, so a
+    // strict site cannot refuse it.
+    void installNetTap(CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) {
+        if (!context || !context->IsValid()) return;
+        CefRefPtr<CefV8Value> global = context->GetGlobal();
+        if (!global || !global->IsValid()) return;
+        // DONTDELETE|READONLY: the page can call the sink but cannot remove or
+        // replace it. It is still reachable from page JS (every JS bridge is).
+        global->SetValue("lucynNetTap",
+                         CefV8Value::CreateFunction("lucynNetTap", new LucynNetTapHandler()),
+                         static_cast<CefV8Value::PropertyAttribute>(
+                             V8_PROPERTY_ATTRIBUTE_DONTDELETE | V8_PROPERTY_ATTRIBUTE_READONLY));
+        CefRefPtr<CefV8Value> rv;
+        CefRefPtr<CefV8Exception> ex;
+        context->Eval(kNetTapJs, frame ? frame->GetURL() : CefString("about:blank"), 0, rv, ex);
     }
 
     void OnContextReleased(CefRefPtr<CefBrowser> browser,
@@ -771,6 +1309,147 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Input forwarding: viewer window -> Chromium (listen mode / any headful run).
+// The X11 window draws an off-screen browser's frames; preview::InputEvent is
+// the window telling us what the human did with the mouse and keyboard. The
+// Send* APIs belong on CEF's UI thread, so everything posts there.
+// ---------------------------------------------------------------------------
+namespace {
+std::mutex g_viewMu;
+std::shared_ptr<SharedState> g_viewState;  // the browser the window is showing
+
+void MouseMoveTask(CefRefPtr<CefBrowser> b, int x, int y, unsigned int mods) {
+    if (!b) return;
+    CefMouseEvent me;
+    me.x = x;
+    me.y = y;
+    me.modifiers = mods;
+    b->GetHost()->SendMouseMoveEvent(me, false);
+}
+
+void MouseClickTask(CefRefPtr<CefBrowser> b, int x, int y, int button, bool up,
+                    unsigned int mods) {
+    if (!b) return;
+    CefMouseEvent me;
+    me.x = x;
+    me.y = y;
+    me.modifiers = mods;
+    const CefBrowserHost::MouseButtonType t =
+        (button == 1) ? MBT_LEFT : (button == 2) ? MBT_MIDDLE : MBT_RIGHT;
+    b->GetHost()->SendMouseClickEvent(me, t, up, /*clickCount=*/1);
+}
+
+void MouseWheelTask(CefRefPtr<CefBrowser> b, int x, int y, int deltaY, unsigned int mods) {
+    if (!b) return;
+    CefMouseEvent me;
+    me.x = x;
+    me.y = y;
+    me.modifiers = mods;
+    b->GetHost()->SendMouseWheelEvent(me, 0, deltaY);
+}
+
+void FocusTask(CefRefPtr<CefBrowser> b, bool focus) {
+    if (std::getenv("LUCYN_DEBUG_INPUT"))
+        std::fprintf(stderr, "[input-dbg] SetFocus(%d)\n", focus ? 1 : 0);
+    if (b) b->GetHost()->SetFocus(focus);
+}
+
+// One keystroke: RAWKEYDOWN (and KEYUP) plus one CHAR event per code point —
+// that pair is what Chromium's input pipeline needs to actually type text.
+void KeyTask(CefRefPtr<CefBrowser> b, bool up, unsigned int vk, int nativeKey,
+             unsigned int mods, std::string text) {
+    if (!b) return;
+    if (std::getenv("LUCYN_DEBUG_INPUT"))
+        std::fprintf(stderr, "[input-dbg] KeyTask up=%d vk=0x%x native=%d mods=0x%x text=\"%.16s\"\n",
+                     up ? 1 : 0, vk, nativeKey, mods, text.c_str());
+    CefKeyEvent ke;
+    ke.modifiers = mods;
+    ke.windows_key_code = vk;
+    ke.native_key_code = nativeKey;
+    ke.is_system_key = false;
+    if (up) {
+        ke.type = KEYEVENT_KEYUP;
+        b->GetHost()->SendKeyEvent(ke);
+        return;
+    }
+    ke.type = KEYEVENT_RAWKEYDOWN;
+    b->GetHost()->SendKeyEvent(ke);
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        char32_t cp = lead;
+        size_t len = 1;
+        if (lead >= 0xF0 && i + 3 < text.size()) {
+            cp = (lead & 0x07u) << 18 | (static_cast<unsigned char>(text[i + 1]) & 0x3Fu) << 12 |
+                 (static_cast<unsigned char>(text[i + 2]) & 0x3Fu) << 6 |
+                 (static_cast<unsigned char>(text[i + 3]) & 0x3Fu);
+            len = 4;
+        } else if (lead >= 0xE0 && i + 2 < text.size()) {
+            cp = (lead & 0x0Fu) << 12 | (static_cast<unsigned char>(text[i + 1]) & 0x3Fu) << 6 |
+                 (static_cast<unsigned char>(text[i + 2]) & 0x3Fu);
+            len = 3;
+        } else if (lead >= 0xC0 && i + 1 < text.size()) {
+            cp = (lead & 0x1Fu) << 6 | (static_cast<unsigned char>(text[i + 1]) & 0x3Fu);
+            len = 2;
+        }
+        i += len;
+        if (cp < 0x20 || cp == 0x7F) continue;  // control chars have no CHAR event
+        // THE missing piece: without switching to KEYEVENT_CHAR this loop used to
+        // re-send RAWKEYDOWN — Chromium never inserts text from a raw keydown, so
+        // the listener saw keydowns while every field stayed empty.
+        //
+        // windows_key_code STAYS the mapped VK (cefclient's GTK client does the
+        // same for its RAWKEYDOWN+CHAR pair). The Windows-style variant — code =
+        // the character — breaks on Linux: '.' is 0x2e = VK_DELETE and Chromium
+        // swallows the event instead of typing.
+        ke.type = KEYEVENT_CHAR;
+        ke.character = ke.unmodified_character = static_cast<char16_t>(cp);
+        b->GetHost()->SendKeyEvent(ke);
+    }
+}
+
+void HandleViewInput(const preview::InputEvent& e) {
+    if (std::getenv("LUCYN_DEBUG_INPUT"))
+        std::fprintf(stderr, "[input-dbg] HandleViewInput kind=%d\n", static_cast<int>(e.kind));
+    std::shared_ptr<SharedState> st;
+    {
+        std::lock_guard<std::mutex> lk(g_viewMu);
+        st = g_viewState;
+    }
+    if (!st) return;
+    CefRefPtr<CefBrowser> b;
+    {
+        std::lock_guard<std::mutex> lk(st->mu);
+        b = st->browser;
+    }
+    if (!b) return;
+    switch (e.kind) {
+        case preview::InputEvent::Move:
+            CefPostTask(TID_UI, base::BindOnce(&MouseMoveTask, b, static_cast<int>(e.x),
+                                              static_cast<int>(e.y), e.modifiers));
+            break;
+        case preview::InputEvent::Down:
+        case preview::InputEvent::Up:
+            CefPostTask(TID_UI, base::BindOnce(&MouseClickTask, b, static_cast<int>(e.x),
+                                              static_cast<int>(e.y), e.button,
+                                              e.kind == preview::InputEvent::Up, e.modifiers));
+            break;
+        case preview::InputEvent::Wheel:
+            CefPostTask(TID_UI, base::BindOnce(&MouseWheelTask, b, static_cast<int>(e.x),
+                                              static_cast<int>(e.y), e.deltaY, e.modifiers));
+            break;
+        case preview::InputEvent::KeyDown:
+        case preview::InputEvent::KeyUp:
+            CefPostTask(TID_UI, base::BindOnce(&KeyTask, b, e.kind == preview::InputEvent::KeyUp,
+                                              e.keyCode, e.nativeKey, e.modifiers, e.text));
+            break;
+        case preview::InputEvent::Focus:
+            CefPostTask(TID_UI, base::BindOnce(&FocusTask, b, e.focus));
+            break;
+    }
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // CEF UI-thread tasks — bound with base::BindOnce and posted to TID_UI.
 // They capture ONLY refcounted / copyable values (CefRefPtr, shared_ptr,
 // std::string), never a raw Impl*, so base::BindOnce's "no raw pointer
@@ -784,6 +1463,19 @@ private:
 void CreateBrowserTask(CefRefPtr<LucynClient> client,
                        std::shared_ptr<SharedState> state,
                        const std::string& url) {
+    // Headful: this browser is the one the window shows — remember it for the
+    // input forwarding and install the handler before the window opens.
+    {
+        std::lock_guard<std::mutex> lk(g_viewMu);
+        g_viewState = state;
+        preview::setInputHandler(&HandleViewInput);
+    }
+
+    // Headful: open the viewer window BEFORE the browser exists, so the very
+    // first painted frame already has somewhere to go. No display available?
+    // start() says false and the engine stays headless — not an error.
+    preview::start("LucyN", state->width, state->height);
+
     CefWindowInfo window_info;
     window_info.SetAsWindowless(0);  // windowless: parent 0, no real window (off-screen)
 
@@ -1068,15 +1760,80 @@ int executeCefProcess(int argc, char** argv) {
     return CefExecuteProcess(main_args, app, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// Run-time CEF check — the "stack smashing detected" guard.
+//
+// A binary compiled against one CEF build, running against a DIFFERENT libcef
+// beside it, does not fail cleanly: the C API structs drift and the process dies
+// with stack smashing / access violations somewhere inside Chromium. That is
+// exactly what a hand-copied or half-updated runtime looks like from the
+// outside, so refuse to start instead of crashing obscurely.
+//
+// cef_version_info() is a plain C function exported by every libcef (it returns
+// the version of the library that is actually loaded), so it is safe to call
+// before CefInitialize().
+// ---------------------------------------------------------------------------
+static bool runtimeMatchesBuild(std::string& why) {
+    struct { int entry; int built; const char* name; } checks[] = {
+        {0, CEF_VERSION_MAJOR,    "CEF_VERSION_MAJOR"},
+        {1, CEF_VERSION_MINOR,    "CEF_VERSION_MINOR"},
+        {2, CEF_VERSION_PATCH,    "CEF_VERSION_PATCH"},
+        {3, CEF_COMMIT_NUMBER,    "CEF_COMMIT_NUMBER"},
+        {4, CHROME_VERSION_MAJOR, "CHROME_VERSION_MAJOR"},
+        {5, CHROME_VERSION_MINOR, "CHROME_VERSION_MINOR"},
+        {6, CHROME_VERSION_BUILD, "CHROME_VERSION_BUILD"},
+        {7, CHROME_VERSION_PATCH, "CHROME_VERSION_PATCH"},
+    };
+    std::string got;
+    for (const auto& c : checks) {
+        const int v = cef_version_info(c.entry);
+        if (v != c.built) {
+            why = std::string(c.name) + " is " + std::to_string(v) +
+                  " in the loaded libcef but " + std::to_string(c.built) +
+                  " in the build (libcef " + std::to_string(cef_version_info(0)) + "." +
+                  std::to_string(cef_version_info(1)) + "." +
+                  std::to_string(cef_version_info(2)) + ", built for " CEF_VERSION ")";
+            return false;
+        }
+        if (!got.empty()) got += ".";
+        got += std::to_string(v);
+    }
+    (void)got;
+    return true;
+}
+
 bool initCef(int argc, char** argv) {
     if (g_initialized.load()) return true;
+
+    // Refuse a mismatched runtime BEFORE touching any other CEF entry point.
+    {
+        std::string why;
+        if (!runtimeMatchesBuild(why)) {
+            std::fprintf(stderr,
+                "lucyn: the Chromium runtime next to this binary does NOT match the build:\n"
+                "  %s\n"
+                "That mismatch is what shows up as \"stack smashing detected\" at run time.\n"
+                "Fix: re-run ./scripts/install.sh and rebuild, or copy the whole cef/\n"
+                "subfolder together with the binary (never a libcef from another build).\n",
+                why.c_str());
+            return false;
+        }
+    }
+
     g_contextReady.store(false);
     g_shuttingDown.store(false);
 
 #ifdef _WIN32
     CefMainArgs main_args(GetModuleHandle(nullptr));
 #else
-    CefMainArgs main_args(argc, argv);
+    // Give CEF a CLEAN command line: program name only. Chromium parses the same
+    // argv we do, and a few of our switches collide with real Chromium switches
+    // (--headless above all). Subprocess detection is unaffected: that happens in
+    // executeCefProcess() at the top of main(), with the real argv, where CEF needs
+    // `--type=renderer` and friends.
+    std::vector<char*> cleanArgv;
+    if (argc > 0 && argv != nullptr && argv[0] != nullptr) cleanArgv.push_back(argv[0]);
+    CefMainArgs main_args(static_cast<int>(cleanArgv.size()), cleanArgv.data());
 #endif
     g_app = new LucynApp();
 
@@ -1127,9 +1884,15 @@ bool initCef(int argc, char** argv) {
         std::string framework;
         const std::string exe = core::exeDir();
         if (!exe.empty()) {
-            const std::string beside = exe + "/Chromium Embedded Framework.framework";
-            if (std::ifstream(beside + "/Resources/icudtl.dat", std::ios::binary).good())
-                framework = beside;
+            // The runtime now lives in ONE subfolder beside the executable
+            // (<exe>/cef/…); the old flat layout is still accepted.
+            for (const std::string& dir : {exe + "/cef/Chromium Embedded Framework.framework",
+                                           exe + "/Chromium Embedded Framework.framework"}) {
+                if (std::ifstream(dir + "/Resources/icudtl.dat", std::ios::binary).good()) {
+                    framework = dir;
+                    break;
+                }
+            }
         }
         if (framework.empty()) {
 #ifdef LUCYN_CEF_FRAMEWORK_DIR
@@ -1160,8 +1923,15 @@ bool initCef(int argc, char** argv) {
         std::string resources;
         const std::string exe = core::exeDir();
         if (!exe.empty()) {
-            std::ifstream probe(exe + "/icudtl.dat", std::ios::binary);
-            if (probe.good()) resources = exe;
+            // The runtime lives in ONE subfolder beside the executable: <exe>/cef/
+            // (so lucyn's own folder holds nothing but lucyn + nothing-data/).
+            // The old flat layout — icudtl.dat directly in <exe> — is still accepted.
+            for (const std::string& dir : {exe + "/cef", exe}) {
+                if (std::ifstream(dir + "/icudtl.dat", std::ios::binary).good()) {
+                    resources = dir;
+                    break;
+                }
+            }
         }
         if (resources.empty()) {
 #ifdef LUCYN_CEF_RESOURCES_DIR
@@ -1203,12 +1973,21 @@ bool initCef(int argc, char** argv) {
 
 void shutdownCef() {
     if (!g_initialized.load() || g_shuttingDown.exchange(true)) return;
+    preview::stop();          // close the viewer window before tearing CEF down
     CefShutdown();
     g_app = nullptr;
     g_initialized.store(false);
 }
 
 bool isCefInitialized() { return g_initialized.load(); }
+
+void setPreviewWindow(bool on) { preview::setEnabled(on); }
+bool previewWindowEnabled() { return preview::enabled(); }
+
+// Listen mode lives OUTSIDE the anonymous namespace above: this is the public
+// entry point main.cpp calls (the flag itself and the injected JS stay inside).
+void setListenBar(bool on) { g_listenBar.store(on); }
+bool listenBarEnabled() { return g_listenBar.load(); }
 
 std::string cefVersion() { return CEF_VERSION; }
 
@@ -1414,6 +2193,12 @@ void BrowserInstance::setResourceHandler(ResourceHandler h) {
     if (!impl_) return;
     std::lock_guard<std::mutex> lock(impl_->state->mu);
     impl_->state->resourceHandler = std::move(h);
+}
+
+void BrowserInstance::setNoteHandler(NoteHandler h) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->state->mu);
+    impl_->state->noteHandler = std::move(h);
 }
 
 void BrowserInstance::allCookies(const std::string& url, CookieListCallback cb) {

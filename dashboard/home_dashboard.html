@@ -106,7 +106,21 @@
   function ingest(envText) {
     var env, cap;
     try { env = JSON.parse(envText); cap = JSON.parse(env.payload); } catch (e) { return; }
-    if (!cap || typeof cap.id !== "number" || byId[cap.id]) return;
+    if (!cap || typeof cap.id !== "number") return;
+    var seen = byId[cap.id];
+    if (seen) {
+      // The SAME id again: a capture that gained its body after it first streamed
+      // in (the engine learns what the page read a moment after the headers).
+      // Replace the stored copy in place rather than counting a second request.
+      seen.env = envText;
+      seen.cap = cap;
+      if (seen.tr) {
+        var sizeCell = seen.tr.children[6];
+        if (sizeCell) sizeCell.textContent = human(cap.bodyBytes);
+      }
+      if (selected === seen) select(seen);   // refresh an open detail panel
+      return;
+    }
     if (paused) { pendingQ.push(envText); updatePending(); return; }
     var it = { env: envText, cap: cap, seal: "unk", tr: null };
     byId[cap.id] = it;

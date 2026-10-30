@@ -26,7 +26,9 @@ import type { Interface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { connect } from "node:net";
+import type { Socket } from "node:net";
 
 // ---- binary resolution ------------------------------------------------------
 
@@ -91,8 +93,33 @@ export interface LucynOptions {
   adblock?: boolean;
   /** Additional ABP/uBO-format rule file. */
   adblockList?: string;
+  /**
+   * Start the engine without a window (default `false`).
+   *
+   * By default `lucyn` opens a real Chromium window that follows whatever the
+   * script does — visit() navigates it, so you can watch the scrape. Pass
+   * `headless: true` on servers, in CI, or anywhere a display is not wanted;
+   * everything else behaves identically (the page is rendered off-screen either
+   * way, so screenshots work in both modes).
+   */
+  headless?: boolean;
   /** Path to the `lucyn` binary (default: `LUCYN_BIN`, monorepo build, then PATH). */
   binary?: string;
+  /**
+   * Hook into an engine that is ALREADY running instead of starting a new one
+   * (default `true`). A `lucyn` launched in a terminal — including
+   * `lucyn --listen` — advertises itself in `nothing-data/engine.json` next to
+   * the binary; the client finds that file, connects to the loopback control
+   * socket and drives that same browser. This is what avoids the "broken pipe"
+   * / zygote errors two engines used to hit when they raced for the same
+   * Chromium cache. When nothing is running, the client spawns its own engine
+   * exactly as before.
+   *
+   * An attached `close()` only disconnects: the engine and its window keep
+   * running. Set `LUCYN_ATTACH=0` (or pass `attach: false`) to always start a
+   * private engine instead.
+   */
+  attach?: boolean;
   /** Engine JSON config (search defaults). */
   config?: string;
   /**
@@ -384,9 +411,13 @@ export class LucynSession extends EventEmitter {
   private readonly _console: boolean;
   private readonly _adblock: boolean;
   private readonly _adblockList: string;
+  private readonly _headless: boolean;
   private readonly _config: string;
   private readonly _binary: string;
+  private readonly _attach: boolean;
   private _proc: ChildProcess | null = null;
+  private _sock: Socket | null = null;
+  private _attached = false;
   private _rl: Interface | null = null;
   private readonly _pending = new Map<number, PendingEntry>();
   private _started = false;
@@ -400,16 +431,22 @@ export class LucynSession extends EventEmitter {
     this._console = opts.console ?? false;
     this._adblock = opts.adblock ?? true;
     this._adblockList = opts.adblockList ?? "";
+    this._headless = opts.headless ?? false;
     this._config = opts.config ?? "";
     this._binary = findBinary(opts.binary);
+    this._attach = opts.attach ?? true;
   }
 
   // ---- lifecycle ------------------------------------------------------------
 
-  /** Start the engine process. Called lazily on first command. */
+  /** Start the engine — or hook into one that is already running. Called lazily on first command. */
   private async _ensureStarted(): Promise<void> {
     if (this._started) return;
     this._started = true;
+
+    // An engine that is already up (launched in a terminal, --listen, or by an
+    // earlier script) wins over starting a second Chromium: attach to it.
+    if (this._attach && (await this._tryAttach())) return;
 
     const args: string[] = [
       "--settle", String(this._settleTimeoutMs),
@@ -417,6 +454,7 @@ export class LucynSession extends EventEmitter {
     if (this._console) args.push("--console");
     if (!this._adblock) args.push("--no-adblock");
     if (this._adblockList) args.push("--adblock-list", this._adblockList);
+    if (this._headless) args.push("--headless");
     if (this._config) args.push("--config", this._config);
     // The client always asks for capture events: they cost nothing until a listener is attached
     // and a late-attached onRequest() must not miss the very first request.
@@ -452,6 +490,86 @@ export class LucynSession extends EventEmitter {
     if (!proc.stdout) throw new Error("lucyn process has no stdout pipe");
     this._rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
     this._rl.on("line", (line: string) => this._onLine(line));
+  }
+
+  /**
+   * Attach to an engine that is already running: find its descriptor
+   * (`nothing-data/engine.json` next to the binary), connect to the loopback
+   * control socket and verify it speaks the protocol. Resolves false when
+   * there is nothing to attach to — the caller then spawns as usual.
+   */
+  private async _tryAttach(): Promise<boolean> {
+    if (process.env.LUCYN_ATTACH === "0") return false;
+    // A PATH-resolved bare "lucyn" gives us no folder to look in.
+    if (!this._binary.includes("/") && !this._binary.includes("\\")) return false;
+
+    const desc = `${dirname(resolve(this._binary))}/nothing-data/engine.json`;
+    let ep: { port?: unknown; host?: unknown } | null = null;
+    try {
+      if (existsSync(desc)) ep = JSON.parse(readFileSync(desc, "utf8")) as { port?: unknown; host?: unknown };
+    } catch {
+      ep = null; // stale or garbled descriptor: ignore it
+    }
+    const port = typeof ep?.port === "number" ? ep.port : 0;
+    if (!port) return false;
+    const host = typeof ep?.host === "string" ? ep.host : "127.0.0.1";
+
+    const sock = connect({ host, port });
+    const connected = await new Promise<boolean>((res) => {
+      let settled = false;
+      const done = (v: boolean) => { if (!settled) { settled = true; res(v); } };
+      sock.setTimeout(1500, () => { sock.destroy(); done(false); });
+      sock.once("error", () => done(false));
+      sock.once("connect", () => {
+        sock.setTimeout(0);   // clear the connect timeout: this socket is long-lived
+        done(true);
+      });
+    });
+    if (!connected) return false;
+
+    this._sock = sock;
+    this._attached = true;
+    this._rl = createInterface({ input: sock, crlfDelay: Infinity });
+    this._rl.on("line", (line: string) => this._onLine(line));
+    sock.on("error", () => { /* "close" always follows; handled there */ });
+    sock.on("close", () => {
+      if (this._closed) return;
+      this._rejectAll("engine disconnected (the attached engine shut down)");
+      this.emit("exit", null, null);
+    });
+
+    // Protocol check: a real engine answers `moonbug` with its current ports.
+    try {
+      this.moonbug._ports = await this._probeAttach();
+      return true;
+    } catch {
+      this._attached = false;
+      this._sock = null;
+      this._rl = null;
+      try { sock.destroy(); } catch { /* ignore */ }
+      return false;
+    }
+  }
+
+  /** Ask the attached engine for its Moonbug ports; times out when it is not an engine. */
+  private _probeAttach(): Promise<MoonbugPorts> {
+    return new Promise<MoonbugPorts>((res, reject) => {
+      const timer = setTimeout(() => {
+        this._pending.delete(0);
+        reject(new Error("attach probe timed out"));
+      }, 2500);
+      this._pending.set(0, {
+        resolve: (v) => { clearTimeout(timer); res(v as MoonbugPorts); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      this._sock?.write(JSON.stringify({ v: 1, id: 0, cmd: "moonbug" }) + "\n", (err?: Error | null) => {
+        if (err) {
+          clearTimeout(timer);
+          this._pending.delete(0);
+          reject(err);
+        }
+      });
+    });
   }
 
   private _onLine(line: string): void {
@@ -507,13 +625,13 @@ export class LucynSession extends EventEmitter {
         const id = nextId();
         this._pending.set(id, { resolve, reject });
         const line = serialise({ v: 1, id, ...cmd }) + "\n";
-        const stdin = this._proc?.stdin;
-        if (!stdin) {
+        const sink = this._sock ?? this._proc?.stdin;
+        if (!sink) {
           this._pending.delete(id);
-          reject(new Error("lucyn process has no stdin pipe"));
+          reject(new Error("lucyn engine is not running (no attached socket and no process)"));
           return;
         }
-        stdin.write(line, (err?: Error | null) => {
+        sink.write(line, (err?: Error | null) => {
           if (err) {
             this._pending.delete(id);
             reject(err);
@@ -716,18 +834,33 @@ export class LucynSession extends EventEmitter {
     await this._send({ cmd: "clearCookies" });
   }
 
-  /** Gracefully shut down the engine process. */
+  /**
+   * Shut the session down. A session that SPAWNED its engine sends `quit` and
+   * lets it exit cleanly (that removes its `engine.json` descriptor), force-
+   * killing only a straggler; an ATTACHED session only disconnects — the engine
+   * and its window keep running for whoever owns it.
+   */
   async close(): Promise<void> {
     if (this._closed) return;
-    this._closed = true;
+    if (this._attached) {
+      this._closed = true;
+      try { this._rl?.close(); } catch { /* ignore */ }
+      try { this._sock?.end(); } catch { /* ignore */ }
+      return;
+    }
     try {
       await this._send({ cmd: "quit" });
     } catch {
       // Ignore — process may already be gone.
     }
+    this._closed = true;
     if (this._proc) {
-      this._proc.stdin?.end();
-      this._proc.kill();
+      const proc = this._proc;
+      proc.stdin?.end();
+      // Give the engine a moment to exit on its own (clean quit = descriptor
+      // removed), then force-kill only if it is somehow still around.
+      await new Promise<void>((r) => setTimeout(r, 400));
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
     }
   }
 }

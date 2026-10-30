@@ -26,8 +26,29 @@ Limits, per `Moonbug::Options`: **1 MiB** of response body kept per capture (`ma
 the last **500** captures kept for late joiners and the dashboard (`historySize`). The body preview
 is cut, but `responseBytes` always reports the true size.
 
-Listeners fire in three places: `onRequest` (request about to be sent — request fields only),
-`onResponse` (response or failure is in) and `onCapture` (the finished capture, after that).
+**Where `responseBody` comes from.** Two complementary paths (see the README's *See
+everything* section):
+
+- **The response filter (primary).** Chromium never volunteers response bytes to the browser
+  process, but CEF lets the engine install a `CefResponseFilter` on the response stream
+  (`GetResourceResponseFilter` in `modules/cef_host/src/browser_host.cpp`): every text/code
+  resource — main document, scripts, stylesheets, JSON, error pages — passes through to the page
+  untouched while a copy is attached to the capture as a `Body` event. Cap: 4 MiB per response,
+  and it carries the response `Content-Type`, which is also what decides whether the file becomes
+  an artifact in `nothing-data/artifacts/` (full bytes on disk; Moonbug then trims its own preview
+  to the 1 MiB above).
+- **The page-side tap (fallback).** The older path wraps the page's own `fetch()` and
+  `XMLHttpRequest` (`kNetTapJs`) and reports what the page read. Both paths can see the same
+  response; the controller recognizes the duplicate by content hash, so a capture ends up with
+  exactly one body and a file is saved once.
+
+A body usually arrives just after the capture's `Finish`: the capture is then patched in place and
+re-published (same `id`), which is what `onUpdate` and the dashboard's live refresh are for.
+Binary responses (images, fonts, media) get no filter at all — headers and byte count only.
+
+Listeners fire in four places: `onRequest` (request about to be sent — request fields only),
+`onResponse` (response or failure is in), `onCapture` (the finished capture, after that) and
+`onUpdate` (a stored capture gained its body — same id, new content).
 
 ## Turning it on
 

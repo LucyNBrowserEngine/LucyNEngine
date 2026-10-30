@@ -43,27 +43,29 @@ path for local development — that is a repo convenience, not the install path 
 **Finding the binary.** In order: `opts.binary` → `LUCYN_BIN` env var → `../../build/bin/lucyn`
 (the monorepo default after `cmake --build build`) → `lucyn` on `PATH`.
 
-## Quick start
-
-```js
+## Quick start```js
 import Lucyn from "@lucyn/browser";
 
-const a = new Lucyn();
+const a = new Lucyn();                  // headful: a window follows every command
+// const a = new Lucyn({ headless: true });   // no window (servers, CI)
 
 const { status, url, title } = await a.visit("https://example.com");
 console.log(status, title);                 // 200 "Example Domain"
 
-await a.waitFor("#ready", { timeout: 10000 });
-await a.fill("input[name=q]", "Ada");
-await a.submit("form#search");
+const first = await a.extract("p");         // first match in the settled DOM
+const links = await a.extractAll("a");      // every match
+const html  = await a.html();
+
+await a.search("LucyN browser", { engine: "brave" });   // a real results page
 await a.waitIdle({ quiet: 300 });
 
-const heading = await a.extract("h1");
-const links   = await a.extractAll("a");
-const html    = await a.html();
+const png = await a.screenshot("results.png", { width: 1280 });
 
 await a.close();                            // always close: it ends the engine process
 ```
+
+Your own `package.json` needs `"type": "module"` — this package is ESM, and without it Node
+prints `[MODULE_TYPELESS_PACKAGE_JSON]` and re-parses your file as a module on every run.
 
 ## Constructor
 
@@ -72,14 +74,17 @@ const a = new Lucyn({
   settleTimeoutMs: 5000,   // JS/network settle budget per visit
   console: false,          // echo page console.* to stderr
   adblock: true,           // built-in request filtering
-  adblockList: "",         // extra EasyList/uBO rules file
-  config: "",              // engine config JSON (search defaults)
+  adblockList: "",         // extra EasyList/uBO rules file (must exist)
+  headless: false,         // true = no window; false (default) shows the page the script drives
+  config: "",              // engine config JSON (search defaults; must exist)
   binary: "",              // explicit path to the lucyn binary
   moonbug: null,           // {raw, signed, dashboard} — start capture listeners with the engine
 });
 ```
 
-Every session is its own process with its own cookie jar.
+Every session is its own process with its own cookie jar. **The window is the engine's, not a
+second browser**: `visit()` navigates it, `screenshot()` reads the same Chromium frame, and
+`headless: true` simply skips the window — nothing else changes.
 
 ## Commands
 

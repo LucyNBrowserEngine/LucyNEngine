@@ -3,7 +3,10 @@
 // Thread-safety: none needed — one command at a time.
 
 #include <lucyn/controller/controller.h>
+#include <lucyn/core/assets.h>          // isTextAsset / isScriptAsset / assetExtension
 #include <lucyn/core/paths.h>
+#include <lucyn/logger/logger.h>
+#include <lucyn/net/deobfuscate.h>      // the second view of a saved script
 #include <lucyn/net/moonbug.h>
 #include <lucyn/security/nullbyte.h>
 #include <lucyn/server/capture_server.h>
@@ -18,9 +21,11 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -296,6 +301,16 @@ fs::path uniqueDownloadPath(const std::string& dir, const std::string& name, boo
     return p;
 }
 
+// FNV-1a: content fingerprint of a response body (duplicate recognition).
+std::size_t fnv1a(const std::string& s) {
+    std::size_t h = static_cast<std::size_t>(1469598103934665603ull);
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= static_cast<std::size_t>(1099511628211ull);
+    }
+    return h;
+}
+
 } // anon namespace
 
 // ---- Controller::Impl -------------------------------------------------------
@@ -342,6 +357,34 @@ struct Controller::Impl {
     // nothing that outlives it (destroyed after cef_ stops calling us).
     std::mutex resMu_;
     std::map<unsigned long long, net::Capture> pendingRes_;
+    // URL -> the body the page read, and the capture that owns it (resMu_). A Body
+    // event normally lands AFTER Finish (the page reads the response once the
+    // network is done), so it is attached to the stored capture; when the tap wins
+    // the race the text waits here for Finish to merge it.
+    struct UrlBody { std::uint64_t captureId = 0; std::string body; bool truncated = false; long long ts = 0;
+                    // Content hash of the last body seen for this URL: the response
+                    // filter and the page-side tap both report fetch/XHR responses,
+                    // and this is how the duplicate is recognized (kept across the
+                    // Finish that clears `body`).
+                    std::size_t bodyHash = 0; bool haveHash = false; };
+    std::map<std::string, UrlBody> bodyBy_;
+
+    static long long wallMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    // Bounded bookkeeping: entries only matter for about a minute, and a parked
+    // body only exists while its request is in flight, so this is cheap. Called
+    // with resMu_ held.
+    void pruneBodyState() {
+        if (bodyBy_.size() <= 256) return;
+        const long long now = wallMs();
+        for (auto it = bodyBy_.begin(); it != bodyBy_.end();) {
+            if (now - it->second.ts > 60000) it = bodyBy_.erase(it); else ++it;
+        }
+        while (bodyBy_.size() > 1024) bodyBy_.erase(bodyBy_.begin());   // pathological storm: shed, in URL order
+    }
 
     // Bridge one CEF resource lifecycle event into Moonbug. Called DIRECTLY on
     // CEF's IO thread from cef_host (not via pump) so captures are live even while
@@ -353,6 +396,33 @@ struct Controller::Impl {
             net::Capture cap = moonbug.begin(ev.method, ev.url, /*profile=*/"", /*impersonating=*/false);
             std::lock_guard<std::mutex> lk(resMu_);
             pendingRes_[ev.requestId] = std::move(cap);
+            return;
+        }
+        // Body: a response body arrived — from LucynBodyFilter (browser process,
+        // every text/code resource) and/or from the renderer's page-side tap.
+        // Both may report the SAME response: the content hash keeps exactly one
+        // of them for Moonbug, while enqueueArtifact() is called either way so a
+        // missing Content-Type on one path can't lose the file.
+        if (ev.phase == Ev::Body) {
+            const std::size_t h = fnv1a(ev.body);
+            std::uint64_t attachId = 0;
+            bool dup = false;
+            {
+                std::lock_guard<std::mutex> lk(resMu_);
+                UrlBody& s = bodyBy_[ev.url];
+                s.ts = wallMs();
+                if (s.haveHash && s.bodyHash == h) {
+                    dup = true;                       // identical duplicate: one body is enough
+                } else {
+                    s.bodyHash = h;
+                    s.haveHash = true;
+                    if (s.captureId) attachId = s.captureId;   // the capture is already out: patch it
+                    else             { s.body = ev.body; s.truncated = ev.bodyTruncated; }  // it is not: park it
+                }
+                pruneBodyState();
+            }
+            if (!dup && attachId) moonbug.attachBody(attachId, ev.body, ev.bodyTruncated);
+            enqueueArtifact(ev.url, ev.contentType, ev.body);
             return;
         }
         // Finish: pull the capture begun at Start and complete it.
@@ -376,13 +446,183 @@ struct Controller::Impl {
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         if (cap.tsMs > 0 && nowMs >= cap.tsMs) cap.timing.totalMs = static_cast<double>(nowMs - cap.tsMs);
+        {
+            // Merge a body that arrived before this Finish, and claim the URL so a
+            // body arriving after it knows which capture to hang on to.
+            std::lock_guard<std::mutex> lk(resMu_);
+            UrlBody& s = bodyBy_[ev.url];
+            const bool fresh = (s.captureId == 0);
+            if (fresh) {
+                if (!s.body.empty()) { cap.responseBody = s.body; cap.bodyTruncated = s.truncated; }
+                s.body.clear();
+                s.truncated = false;
+            }
+            s.captureId = cap.id;
+            s.ts = wallMs();
+            pruneBodyState();
+        }
         moonbug.finish(cap);   // fires onResponse + onCapture → dashboard / events
+    }
+
+    // ---- artifact capture (nothing-data/artifacts) -----------------------------
+    // Every code/document resource that crosses the wire is saved verbatim (the
+    // raw view); every script also gets a best-effort deobfuscated sibling (the
+    // second view). The CEF IO thread only queues a job — a worker thread does
+    // the disk work and the deobfuscation, so capturing never slows a page load.
+    // Declared here, ABOVE the methods that take an ArtifactJob: a parameter type
+    // is not part of the class's complete-context, so it must come first.
+    struct ArtifactJob { std::string url, contentType, body; };
+    struct SeenJob { std::string url; std::size_t hash = 0; };
+    std::mutex artMu;
+    std::condition_variable artCv;
+    std::deque<ArtifactJob> artQ;
+    std::deque<SeenJob> artSeen;    // (url, hash) already queued — filter/tap dedupe
+    bool artStop = false;
+    bool artStarted = false;
+    std::thread artThread;
+
+    // Engine notes (e.g. a page-triggered download landing in nothing-data/downloads):
+    // logged on stderr through the logger AND emitted as a note event so attached
+    // scripts can see it. Called DIRECTLY on the CEF callback thread that produced
+    // them — emit() only takes outMu, which the reply path already shares.
+    void onEngineNote(const std::string& msg) {
+        if (msg.empty()) return;
+        lucyn::logger::defaultLogger().info(msg);
+        emit(eventLine("note", msg));
+    }
+
+    // ---- artifact capture ----------------------------------------------------------------
+
+    // Called from onCefResource (CEF IO thread): classify, dedupe and hand over.
+    // Touches only artMu — never the disk — and never blocks.
+    void enqueueArtifact(const std::string& url, const std::string& contentType,
+                         const std::string& body) {
+        if (body.empty() || url.empty()) return;
+        if (!core::isTextAsset(url, contentType)) return;   // images/media stay headers-only
+        const std::size_t h = fnv1a(body);
+        bool overflow = false;
+        {
+            std::lock_guard<std::mutex> lk(artMu);
+            for (const SeenJob& s : artSeen)
+                if (s.hash == h && s.url == url) return;    // already queued (filter vs tap)
+            artSeen.push_back({url, h});
+            if (artSeen.size() > 1024) artSeen.pop_front();
+            if (artQ.size() >= 512) {
+                overflow = true;                            // pathological storm: drop, say so
+            } else {
+                artQ.push_back({url, contentType, body});
+                if (!artStarted) {
+                    artStarted = true;
+                    artThread = std::thread([this] { artifactLoop(); });
+                }
+            }
+        }
+        artCv.notify_one();
+        if (overflow) onEngineNote("⚠ artifact queue full, dropped " + url);
+    }
+
+    void artifactLoop() {
+        for (;;) {
+            ArtifactJob job;
+            {
+                std::unique_lock<std::mutex> lk(artMu);
+                artCv.wait(lk, [this] { return artStop || !artQ.empty(); });
+                if (artQ.empty()) {
+                    if (artStop) return;    // stop requested and queue drained
+                    continue;
+                }
+                job = std::move(artQ.front());
+                artQ.pop_front();
+            }
+            writeArtifact(job);             // outside the lock: disk + deobfuscation
+        }
+    }
+
+    // Raw view on disk, and — for scripts — the deobfuscated second view next to
+    // it. Names are host__file.ext, uniquified with ~1, ~2, ... so a re-browse
+    // never overwrites an earlier capture.
+    void writeArtifact(const ArtifactJob& job) {
+        namespace fs = std::filesystem;
+        const std::string dir = core::dataDir("artifacts");
+        if (dir.empty()) return;
+
+        std::string host, path, base;
+        if (const std::size_t s = job.url.find("://"); s != std::string::npos) {
+            const std::size_t h = s + 3;
+            const std::size_t e = job.url.find('/', h);
+            host = (e == std::string::npos) ? job.url.substr(h) : job.url.substr(h, e - h);
+            path = (e == std::string::npos) ? std::string() : job.url.substr(e);
+        }
+        if (const std::size_t q = path.find_first_of("?#"); q != std::string::npos)
+            path = path.substr(0, q);
+        auto sanitize = [](std::string v, std::size_t maxLen) {
+            for (char& c : v) {
+                const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+                if (!ok) c = '_';
+            }
+            if (v.size() > maxLen) v.resize(maxLen);
+            return v;
+        };
+        host = sanitize(host, 60);
+        base = sanitize(path.empty() ? std::string() : path.substr(path.find_last_of('/') + 1), 80);
+        if (base.empty()) base = "index";
+        if (base.find('.') == std::string::npos) {
+            const std::string ext = core::assetExtension(job.url, job.contentType);
+            base += ext.empty() ? ".txt" : ext;
+        }
+
+        fs::path p;
+        std::string rel;
+        for (int n = 0; ; ++n) {
+            if (n > 40) return;   // hopeless collision storm: skip rather than spin
+            std::string name = host + "__" + base;
+            if (n > 0) {
+                const std::size_t dot = name.find_last_of('.');
+                const std::string suffix = "~" + std::to_string(n);
+                name = (dot == std::string::npos) ? name + suffix
+                                                  : name.substr(0, dot) + suffix + name.substr(dot);
+            }
+            p = fs::path(dir) / name;
+            std::error_code ec;
+            if (!fs::exists(p, ec)) { rel = "artifacts/" + name; break; }
+        }
+        {
+            std::ofstream f(p, std::ios::binary | std::ios::trunc);
+            if (!f) return;
+            f.write(job.body.data(), static_cast<std::streamsize>(job.body.size()));
+            f.close();
+            if (!f) return;
+        }
+        onEngineNote("💾 saved " + rel + " (" + std::to_string(job.body.size()) +
+                     " bytes) from " + job.url);
+
+        // Second view: attempt the deobfuscation of every script.
+        if (core::isScriptAsset(job.url, job.contentType)) {
+            net::DeobfStats st;
+            const std::string out = net::deobfuscate(job.body, &st);
+            std::string n2 = p.filename().string();
+            const std::size_t dot = n2.find_last_of('.');
+            n2 = (dot == std::string::npos) ? n2 + ".deobf.js"
+                                            : n2.substr(0, dot) + ".deobf" + n2.substr(dot);
+            std::ofstream g(p.parent_path() / n2, std::ios::binary | std::ios::trunc);
+            if (!g) return;
+            g.write(out.data(), static_cast<std::streamsize>(out.size()));
+            g.close();
+            if (!g) return;
+            char what[96];
+            std::snprintf(what, sizeof what, "%zu strings, %zu concats, %zu escapes%s",
+                          st.stringsDecoded, st.concatsFolded, st.escapesDecoded,
+                          st.lookedObfuscated ? "" : " — no obfuscation detected");
+            onEngineNote("🔍 deobfuscated " + rel + " → artifacts/" + n2 + " (" + what + ")");
+        }
     }
 #endif
 
     std::istream& in;
     std::ostream& out;
     std::mutex outMu;              // fetch() runs on a worker thread, so captures can race with replies
+
     // Declared LAST: destroyed first, so its listeners stop before anything they use goes away.
     std::unique_ptr<server::CaptureServer> srv;
 
@@ -442,20 +682,35 @@ struct Controller::Impl {
         // tests never do, so engine commands report "no page loaded" there.
         if (lucyn::cef_host::isCefInitialized()) {
             cef_ = lucyn::cef_host::createInstance();
-            if (cef_)
+            if (cef_) {
                 cef_->setResourceHandler([this](const lucyn::cef_host::BrowserInstance::ResourceEvent& ev) {
                     onCefResource(ev);
                 });
+                cef_->setNoteHandler([this](const std::string& msg) { onEngineNote(msg); });
+            }
         }
         // Session cookies: load nothing-data/cookies.json into Chromium's jar — this is
         // what makes a login survive a new engine run. Needs cef_ (created just above).
         loadCookiesJson();
+        // Headful launch: show the start page right away so the window is not blank
+        // while waiting for the first `visit`. Same browser instance, so the very
+        // first visit command just navigates this window elsewhere.
+        if (cef_ && !opts.startUrl.empty()) cef_->visit(opts.startUrl);
 #endif
     }
 
     ~Impl() {
 #ifdef LUCYN_CONTROLLER_HAVE_CEF
+        // Stop the artifact worker first: it drains the queue, so the last few
+        // captures finish writing before anything it uses goes away.
+        {
+            std::lock_guard<std::mutex> lk(artMu);
+            artStop = true;
+        }
+        artCv.notify_all();
+        if (artThread.joinable()) artThread.join();
         if (cef_) cef_->setResourceHandler(nullptr);   // stop IO-thread callbacks before members die
+        if (cef_) cef_->setNoteHandler(nullptr);
 #endif
         saveCookiesJson();                     // clean shutdown: write Chromium's jar back to cookies.json
         srv.reset();                          // stop listeners first
@@ -465,6 +720,7 @@ struct Controller::Impl {
     void emit(const std::string& line) {
         std::lock_guard<std::mutex> lk(outMu);
         if (opts.onEvent) opts.onEvent(line);
+        if (opts.suppressEvents && opts.suppressEvents()) return;   // keep raw JSON off a listen-mode terminal
         out << line << '\n';
         out.flush();
     }

@@ -17,6 +17,7 @@ Moonbug::ListenerId Moonbug::add(Kind k, Listener fn) {
 Moonbug::ListenerId Moonbug::onRequest(Listener fn)  { return add(Kind::Request,  std::move(fn)); }
 Moonbug::ListenerId Moonbug::onResponse(Listener fn) { return add(Kind::Response, std::move(fn)); }
 Moonbug::ListenerId Moonbug::onCapture(Listener fn)  { return add(Kind::Capture,  std::move(fn)); }
+Moonbug::ListenerId Moonbug::onUpdate(Listener fn)   { return add(Kind::Update,   std::move(fn)); }
 
 void Moonbug::off(ListenerId id) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -72,6 +73,33 @@ void Moonbug::finish(Capture cap) {
     }
     fire(Kind::Response, cap);
     fire(Kind::Capture, cap);
+}
+
+bool Moonbug::attachBody(std::uint64_t id, const std::string& body, bool truncated) {
+    Capture updated;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto it = history_.rbegin(); it != history_.rend(); ++it) {
+            if (it->id != id) continue;
+            // responseBytes is the TRUE size (what the transport reported); only
+            // fill it in when the transport never could (the CEF path reports the
+            // content length, but a tap that read the text knows better than 0).
+            if (it->responseBytes == 0) it->responseBytes = body.size();
+            it->responseBody  = body;
+            it->bodyTruncated = truncated;
+            if (it->responseBody.size() > opts_.maxBodyBytes) {
+                it->responseBody.resize(opts_.maxBodyBytes);
+                it->bodyTruncated = true;
+            }
+            updated = *it;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+    fire(Kind::Update, updated);
+    return true;
 }
 
 std::vector<Capture> Moonbug::recent(std::size_t n) const {

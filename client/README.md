@@ -44,9 +44,10 @@ import Lucyn from "@lucyn/browser";
 const a = new Lucyn({
   settleTimeoutMs: 5000,      // JS idle timeout per visit
   console: false,             // echo page console.* to stderr
-  adblock: true,               // built-in request filtering (default: true)
-  adblockList: "./filters.txt", // optional additional EasyList/uBO rules
-  config: "./engine.json",     // optional engine config (search defaults)
+  adblock: true,              // built-in request filtering (default: true)
+  headless: false,            // false (default) opens a window that follows the script
+  // adblockList: "./filters.txt",   // optional extra EasyList/uBO rules (must exist)
+  // config: "./engine.json",        // optional engine config (must exist)
 });
 
 // Navigate
@@ -58,12 +59,12 @@ await a.open("https://example.org");
 await a.search("LucyN browser", { engine: "brave" });
 
 // Query the settled DOM
-const heading = await a.extract("h1");          // first match, text content
-const links   = await a.extractAll("a");        // all matches
-const html    = await a.html();                  // full settled HTML
+const first = await a.extract("p");           // first match, text content
+const links  = await a.extractAll("a");       // all matches
+const html   = await a.html();                // full settled HTML
 
-// Engine info
-const { url, captures } = await a.info();
+// Engine info (rename `url` — the destructured name above is already taken)
+const { url: currentUrl, captures } = await a.info();
 
 // Events (page errors, notes, future Moonbug captures)
 a.on("pageError", (e) => console.error("page error:", e.message));
@@ -72,6 +73,9 @@ a.on("note",      (e) => console.log("note:", e.message));
 // Always close when done
 await a.close();
 ```
+
+Your own `package.json` needs `"type": "module"` (this package is ESM) — otherwise Node prints
+`[MODULE_TYPELESS_PACKAGE_JSON]` and re-parses your file as a module on every run.
 
 ## Commands
 
@@ -91,7 +95,7 @@ await a.close();
 | `setCookie(cookie)` | `{name, value, domain \| url, path?, secure?, httpOnly?, expires?}` | restore a session (M7) |
 | `clearCookies()` | none | empties the jar (M7) |
 | `download(url, [opts])` | `url` (http/https), `opts.name`, `opts.overwrite`, `opts.maxBytes`, `opts.referer` | `{path, name, bytes, status, type, url}`: saved into `nothing-data/downloads/`; rejects on a non-2xx / error and leaves no file (M9 addendum) |
-| `screenshot([name], [opts])` | optional file name, `opts.width` | absolute path of the saved PNG in `nothing-data/screenshots/`; rendered offscreen by Chromium — the engine never opens a window |
+| `screenshot([name], [opts])` | optional file name, `opts.width` | absolute path of the saved PNG in `nothing-data/screenshots/`; rendered offscreen by Chromium — it works with or without the window |
 | `info()` | none | `{url, captures}` |
 | `close()` | none | none |
 

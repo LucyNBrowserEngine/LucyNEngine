@@ -11,7 +11,10 @@
 | python3 | reads the CEF build index (scripts) and runs the loopback test servers |
 | Node ≥ 18 | only for the `client/` package |
 
-No libcurl, no libgumbo, no QuickJS, no SDL, no display server — nothing that opens a window.
+No libcurl, no libgumbo, no QuickJS, no SDL — nothing that opens a window is required to build.
+Runs headless by default; `lucyn --listen` opens a plain X11 viewer window when you want to
+watch and click through a page yourself (X11 + libx11-dev are then needed at runtime, not to
+build).
 
 ## 1. Get CEF
 
@@ -46,9 +49,9 @@ folder.
 ctest --test-dir build --output-on-failure
 ```
 
-Eight suites: `core, search, security, moonbug, server, cef_host, controller, cli_download`.
-`cli_download` copies the real `lucyn` binary into a temp directory and drives it against a
-loopback server, so it also proves the binary still runs when moved.
+Nine suites: `core, search, security, moonbug, deobfuscate, server, cef_host, controller,
+cli_download`. `cli_download` copies the real `lucyn` binary into a temp directory and drives it
+against a loopback server, so it also proves the binary still runs when moved.
 
 ## CMake options
 
@@ -90,7 +93,7 @@ alias `lucyn::<name>`.
 
 | Script | What it does |
 |---|---|
-| `scripts/install.sh` | detect OS/arch → confirm or pick a platform → download the CEF *standard* distro from `https://cef-builds.spotifycdn.com/` → sha1-verify → unpack into `third_party/cef/` → print the installed version |
+| `scripts/install.sh` | detect OS/arch → confirm or pick a platform → download the CEF *standard* distro from `https://cef-builds.spotifycdn.com/` → sha1-verify → unpack into `third_party/cef/` → print the installed version. The archive is downloaded **into `third_party/` and unpacked in place** — `/tmp` is never used, so a small tmpfs is fine, and nothing is left loose in the directory you ran it from |
 | `scripts/update_cef.sh` | read the installed version from `third_party/cef/include/cef_version.h`, fetch the newest stable build for your platform, compare, and install it when newer (`--check` never downloads) |
 
 Both print what they found, what is installed and what they did.
@@ -98,9 +101,15 @@ Both print what they found, what is installed and what they did.
 ## Troubleshooting
 
 **`Invalid file descriptor to ICU data`** — CEF could not find `icudtl.dat` next to the loaded
-`libcef.so`. Never move a binary away from the runtime files in `build/bin/`; re-run the build so
-`lucyn_cef_copy_runtime()` puts them back. `initCef()` also embeds the distro's absolute
-`Resources/` path as a fallback, so re-run CMake after moving `third_party/cef/`.
+`libcef.so`. The runtime lives in **`build/bin/cef/`** (one subfolder beside the binaries, found
+through the `$ORIGIN/cef` rpath); never move a binary away from it. Re-run the build so
+`lucyn_cef_copy_runtime()` puts it back. `initCef()` also embeds the distro's absolute `Resources/`
+path as a fallback, so re-run CMake after moving `third_party/cef/`.
+
+**`stack smashing detected` at startup** — the `libcef` next to the binary is from a *different*
+CEF build than the one this binary was compiled with. `initCef()` now detects that mismatch and
+tells you instead of crashing: re-run `./scripts/install.sh`, then rebuild. Copy `lucyn` together
+with the whole `cef/` subfolder, never a lone `libcef.so`.
 
 **`CEF binary distribution not found at: ...`** — `third_party/cef/` is missing or incomplete;
 run `./scripts/install.sh`.

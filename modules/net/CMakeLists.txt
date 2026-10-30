@@ -18,7 +18,7 @@ endif()
 option(LUCYN_BUILD_TESTS "Build module tests" ON)
 
 # ---- library -------------------------------------------------------------------
-add_library(lucyn_net STATIC src/moonbug.cpp)
+add_library(lucyn_net STATIC src/moonbug.cpp src/deobfuscate.cpp)
 add_library(lucyn::net ALIAS lucyn_net)
 target_include_directories(lucyn_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lucyn_net PRIVATE cxx_std_17)
@@ -32,4 +32,8 @@ if(LUCYN_BUILD_TESTS)
   add_executable(test_moonbug tests/test_moonbug.cpp)
   target_link_libraries(test_moonbug PRIVATE lucyn::net)
   add_test(NAME moonbug COMMAND test_moonbug)
+
+  add_executable(test_deobfuscate tests/test_deobfuscate.cpp)
+  target_link_libraries(test_deobfuscate PRIVATE lucyn::net)
+  add_test(NAME deobfuscate COMMAND test_deobfuscate)
 endif()

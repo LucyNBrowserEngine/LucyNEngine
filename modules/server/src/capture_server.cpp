@@ -68,6 +68,7 @@ struct CaptureServer::Impl {
     net::Moonbug& mb;
     const security::Nullbyte& nb;
     net::Moonbug::ListenerId tap = 0;
+    net::Moonbug::ListenerId updTap = 0;   // captures that gain their body after finishing
     std::shared_ptr<Shared> sh = std::make_shared<Shared>();
     std::atomic<std::uint16_t> pRaw{0}, pSigned{0}, pDash{0};   // read by request handlers on server threads
 
@@ -81,6 +82,10 @@ struct CaptureServer::Impl {
         if (tap) return;
         std::shared_ptr<Shared> keep = sh;
         tap = mb.onCapture([keep](const net::Capture& cap) { keep->onCapture(cap); });
+        // A CEF capture finishes from its headers and gets its body a moment later:
+        // the update is re-broadcast as the SAME id with new JSON, so a live client
+        // can replace the row instead of counting a second request.
+        updTap = mb.onUpdate([keep](const net::Capture& cap) { keep->onCapture(cap); });
     }
 
     std::string historyRaw(std::size_t n) {
@@ -148,6 +153,7 @@ CaptureServer::~CaptureServer() {
 void CaptureServer::stop() {
     // 1. Detach from Moonbug, 2. mark closed (a late in-flight capture becomes a no-op), 3. stop the listeners.
     if (p_->tap) { p_->mb.off(p_->tap); p_->tap = 0; }
+    if (p_->updTap) { p_->mb.off(p_->updTap); p_->updTap = 0; }
     std::unique_ptr<TinyElysia> a, b, c;
     {
         std::lock_guard<std::mutex> lk(p_->sh->mu);

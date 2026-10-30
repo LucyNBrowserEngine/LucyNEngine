@@ -3,18 +3,26 @@
 # scripts/install.sh — download and unpack the CEF (Chromium) binary distribution
 # into third_party/cef/, which is the ONLY place LucyN's build looks for it.
 #
+# Everything happens INSIDE third_party/: the archive is downloaded there (next to
+# its destination, on the same disk) and unpacked there. /tmp is never used, so a
+# machine with a small tmpfs can still install — and nothing lands loose in the
+# directory you ran the script from. The archive is deleted once it is unpacked.
+#
 #   ./scripts/install.sh                 # detect this machine, ask, install latest stable
 #   ./scripts/install.sh --yes            # same, no question (CI)
 #   ./scripts/install.sh --platform linuxarm64   # pick the build by hand
 #   ./scripts/install.sh --version 156.0.7+g47dbc1d+chromium-156.0.8078.17
 #   ./scripts/install.sh --check          # show what it would install, change nothing
 #
+# CEF_INDEX_URL / CEF_CDN_BASE override where the index and the archives come from
+# (used by the offline/self-hosted test of this script).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CEF_DIR="$REPO_ROOT/third_party/cef"
-INDEX_URL="https://cef-builds.spotifycdn.com/index.json"
-CDN_BASE="https://cef-builds.spotifycdn.com"
+THIRD_PARTY="$REPO_ROOT/third_party"
+INDEX_URL="${CEF_INDEX_URL:-https://cef-builds.spotifycdn.com/index.json}"
+CDN_BASE="${CEF_CDN_BASE:-https://cef-builds.spotifycdn.com}"
 DISTRO_TYPE="standard"          # standard = headers + libcef_dll wrapper + Release/ + Resources/
 KNOWN_PLATFORMS="linux32 linux64 linuxarm linuxarm64 macosarm64 macosx64 windows32 windows64 windowsarm64"
 
@@ -205,14 +213,17 @@ fi
 
 # ------------------------------------------------------------------ download --
 command -v tar >/dev/null 2>&1 || err "tar is required to unpack the distribution"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-ARCHIVE="$TMP/$FILE_NAME"
+mkdir -p "$THIRD_PARTY"
+# Download NEXT TO the destination (same disk, plenty of room, nothing in /tmp and
+# nothing loose in the caller's directory). Removed at the very end.
+ARCHIVE="$THIRD_PARTY/$FILE_NAME"
+trap '[ -f "$ARCHIVE" ] && rm -f "$ARCHIVE"' EXIT
 
 log ""
-log "Downloading $FILE_NAME ..."
+log "Downloading into $THIRD_PARTY (no temp folder is used):"
+log "  $FILE_NAME"
 if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 -o "$ARCHIVE" "$CDN_BASE/$FILE_NAME"
+    curl -fL --retry 3 --progress-bar -o "$ARCHIVE" "$CDN_BASE/$FILE_NAME"
 elif command -v wget >/dev/null 2>&1; then
     wget -O "$ARCHIVE" "$CDN_BASE/$FILE_NAME"
 else
@@ -228,19 +239,22 @@ if [ -n "$FILE_SHA1" ]; then
 fi
 
 # ------------------------------------------------------------------- unpack ---
-log "Unpacking ..."
-mkdir -p "$TMP/unpacked"
-extract_tarball "$ARCHIVE" "$TMP/unpacked"
-INNER="$(dirname "$(find "$TMP/unpacked" -name cef_version.h -path '*/include/*' | head -1)")/.."
-INNER="$(cd "$INNER" && pwd)"
+# Straight into third_party/ as well: free the old install first (that is the
+# 1.5 GB the new one needs), unpack the tarball's single top folder there, then
+# rename it to cef/. Nothing is copied through a staging directory.
+log "Unpacking into $THIRD_PARTY ..."
+rm -rf "$CEF_DIR"
+extract_tarball "$ARCHIVE" "$THIRD_PARTY"
+rm -f "$ARCHIVE"
+trap - EXIT    # the archive is gone; nothing else to clean up
+
+# The tarball has exactly one top-level folder (cef_binary_<version>_<platform>/).
+INNER="$(find "$THIRD_PARTY" -maxdepth 1 -mindepth 1 -type d -name 'cef_binary_*' 2>/dev/null | head -1)"
+[ -n "$INNER" ] || err "unpacked archive has no cef_binary_* folder in $THIRD_PARTY"
 [ -f "$INNER/include/cef_version.h" ] || err "unpacked archive has no include/cef_version.h"
 
 INSTALLED="$(sed -n 's/^#define CEF_VERSION "\(.*\)".*/\1/p' "$INNER/include/cef_version.h" | head -1)"
 
-# Swap it in: only after a fully successful download + unpack.
-log "Installing into $CEF_DIR ..."
-mkdir -p "$(dirname "$CEF_DIR")"
-rm -rf "$CEF_DIR"
 mv "$INNER" "$CEF_DIR"
 
 log ""

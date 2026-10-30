@@ -10,7 +10,7 @@ endif()
 
 option(LUCYN_BUILD_TESTS "Build module tests" ON)
 
-add_library(lucyn_core STATIC src/paths.cpp)
+add_library(lucyn_core STATIC src/paths.cpp src/assets.cpp)
 add_library(lucyn::core ALIAS lucyn_core)
 target_include_directories(lucyn_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lucyn_core PUBLIC cxx_std_17)

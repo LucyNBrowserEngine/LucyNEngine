@@ -72,6 +72,7 @@ public:
     ListenerId onRequest(Listener fn);    // before the request is sent (request fields only)
     ListenerId onResponse(Listener fn);   // response arrived (or failed), capture complete
     ListenerId onCapture(Listener fn);    // every request lands here, after onResponse
+    ListenerId onUpdate(Listener fn);     // a stored capture gained something (see attachBody)
     void       off(ListenerId id);
 
     // ---- called by HttpClient --------------------------------------------------------------
@@ -79,6 +80,14 @@ public:
     Capture    begin(const std::string& method, const std::string& url, const std::string& profile, bool impersonating);
     // Completes it: trims the body to maxBodyBytes, stores it in the history, fires onResponse then onCapture.
     void       finish(Capture cap);
+
+    // Hang a response body on a capture that is ALREADY in the history — the CEF
+    // path finishes a capture from Chromium's headers and learns what the page
+    // actually read a moment later. The stored capture is patched in place and
+    // onUpdate fires with the new state, so live consumers (streams, dashboard)
+    // see the body without onCapture firing a second time for the same id.
+    // Returns false when the id is no longer in the history (evicted / cleared).
+    bool       attachBody(std::uint64_t id, const std::string& body, bool truncated = false);
 
     // ---- reading ---------------------------------------------------------------------------
     std::vector<Capture> recent(std::size_t n) const;   // oldest first, at most n
@@ -98,7 +107,7 @@ public:
     static void        appendJsonString(std::string& out, const std::string& s);   // quotes + escapes + scrubs
 
 private:
-    enum class Kind { Request, Response, Capture };
+    enum class Kind { Request, Response, Capture, Update };
     ListenerId add(Kind k, Listener fn);
     void       fire(Kind k, const Capture& c);
 
