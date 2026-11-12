@@ -46,6 +46,12 @@ public:
     std::uint16_t signedPort() const;
     std::uint16_t dashboardPort() const;
 
+    // Push one non-capture message (a WebSocket frame: {"event":"wsFrame",...})
+    // to every live stream client. Frames are not HTTP captures, so they are not
+    // sealed/signed — they are broadcast as-is to the raw and dashboard streams
+    // and kept in a small history served by GET /api/ws. Callable from any thread.
+    void broadcastFrame(const std::string& json);
+
     void stop();
 
     static std::string embeddedDashboard();

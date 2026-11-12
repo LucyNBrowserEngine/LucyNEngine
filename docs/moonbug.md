@@ -93,6 +93,41 @@ taken is reported (`raw stream already active`), never silently swapped.
 `{"event":"moonbug", ...}` line announces them. The dashboard's "Verify seal" button posts the
 envelope to `/api/verify`.
 
+## WebSocket frames
+
+HTTP captures stop at the upgrade request. The frames after it are a stream inside Chromium and
+never reach the browser process, so Moonbug taps them in the renderer instead: the engine wraps
+the page's `WebSocket` constructor and `send()` (passively — the real socket is returned with the
+real prototype, nothing is delayed or rewritten) and reports each frame as
+
+```json
+{"event":"wsFrame","direction":"in","url":"wss://web.whatsapp.com/ws/chat?ED=...",
+ "type":"text","data":"...","bytes":412,"truncated":false,"ts":1730000000000}
+```
+
+- `direction` is `in` (server → page) or `out` (page → server).
+- `type` is `text`, `binary` (data is a short hex preview) or `other`.
+- `data` is capped at `--ws-max-bytes` (1 MiB); `bytes` keeps the true frame size.
+- Frames are **not** NULLBYTE-sealed — a seal attests an HTTP request/response pair, and a frame
+  has neither.
+
+Where they go:
+
+| Consumer | How |
+|---|---|
+| dashboard | WebSocket tab, live over its `/stream` |
+| dashboard reconnect | `GET /api/ws?limit=N` (last 500 frames) |
+| raw stream (2005) | `{"event":"wsFrame",...}` lines interleaved with capture objects |
+| disk (optional) | `--ws-dir <path>` appends one JSON line per frame to `<path>/ws-frames.jsonl` |
+
+Switches: `--ws-intercept` (default on), `--ws-max-bytes <n>`. Nothing about the page's socket
+changes: sending and receiving still work exactly as before.
+
+**Limitation:** the tap lives in the page context of every frame (main document and iframes). A
+socket opened inside a **Web Worker** or **Service Worker** runs in a context CEF does not hand
+the engine, so its frames are not captured — the handshake may still appear as an HTTP capture.
+Sockets opened by the page itself (WhatsApp Web, chat widgets, socket.io) are covered.
+
 ## NULLBYTE: why you can trust a capture
 
 Each capture can be sealed with **HMAC-SHA256** over the exact bytes of that capture, so you can

@@ -211,6 +211,12 @@ static void usage(const char* argv0) {
         "  --config <file>    read engine config JSON (search.default, search.searxng_url)\n"
         "  --download <url>   one-shot: save <url> into nothing-data/downloads/, print the saved path, exit\n"
         "                     (0 = saved, 1 = failed). Extras: --name <file>  --overwrite  --max-bytes <n>  --referer <url>\n"
+        "  --no-overrides     disable local file overrides in nothing-data/overrides/\n"
+        "  --override-deobf   auto-override with deobfuscated scripts from nothing-data/artifacts/\n"
+        "  --overrides-dir <d> custom folder for file overrides\n"
+        "  --ws-intercept     enable WebSocket frame tapping (default: on when CEF is active)\n"
+        "  --ws-max-bytes <n> max bytes per WebSocket frame forwarded to Moonbug (default: 1048576)\n"
+        "  --ws-dir <path>    save raw WebSocket frames to this directory (optional)\n"
         "  --version          print version and exit\n"
         "  --help             print this message and exit\n"
         "\n"
@@ -263,6 +269,12 @@ int main(int argc, char** argv) {
             opts.adblockEnabled = false;
         } else if (a == "--adblock-list" && i + 1 < argc) {
             opts.adblockFilterListPath = argv[++i];
+        } else if (a == "--no-overrides") {
+            opts.overridesEnabled = false;
+        } else if (a == "--override-deobf") {
+            opts.autoDeobfOverrides = true;
+        } else if (a == "--overrides-dir" && i + 1 < argc) {
+            opts.overridesDir = argv[++i];
         } else if (a == "--moonbug") {
             if (opts.moonbugRawPort < 0) opts.moonbugRawPort = 2005;
             if (opts.nullbytePort   < 0) opts.nullbytePort   = 2006;
@@ -283,6 +295,12 @@ int main(int argc, char** argv) {
             listenMode = true;
         } else if (a == "--new-instance") {
             newInstance = true;
+        } else if (a == "--ws-intercept") {
+            opts.wsInterceptEnabled = true;  // default true; flag exists for explicitness
+        } else if (a == "--ws-max-bytes" && i + 1 < argc) {
+            opts.wsMaxBytes = static_cast<size_t>(std::atoll(argv[++i]));
+        } else if (a == "--ws-dir" && i + 1 < argc) {
+            opts.wsDir = argv[++i];
         } else if (a == "--open" && i + 1 < argc) {
             startUrl = argv[++i];
         } else if (a == "--config" && i + 1 < argc) {

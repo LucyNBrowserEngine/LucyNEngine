@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -46,6 +47,7 @@ struct Shared {
     bool closed = false;
     const security::Nullbyte* nb = nullptr;
     std::unique_ptr<TinyElysia> raw, signedS, dash;
+    std::deque<std::string> frames;      // recent WebSocket frame lines (oldest first)
 
     void onCapture(const net::Capture& cap) {
         std::lock_guard<std::mutex> lk(mu);
@@ -61,6 +63,31 @@ struct Shared {
             if (wantSigned) signedS->broadcast("/stream", env);
             if (wantDash)   dash->broadcast("/stream", env);
         }
+    }
+
+    // One WebSocket frame, already serialised as {"event":"wsFrame",...}. Not a
+    // capture: no NULLBYTE envelope (a frame has no request/response to attest),
+    // so it goes to the raw stream and the dashboard verbatim.
+    void onFrame(const std::string& json) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (closed) return;
+        frames.push_back(json);
+        while (frames.size() > 500) frames.pop_front();
+        if (raw) raw->broadcast("/stream", json);
+        if (dash) dash->broadcast("/stream", json);
+    }
+
+    std::string frameHistory(std::size_t n) {
+        std::lock_guard<std::mutex> lk(mu);
+        const std::size_t skip = frames.size() > n ? frames.size() - n : 0;
+        std::string out = "[";
+        bool first = true;
+        for (std::size_t i = skip; i < frames.size(); ++i) {
+            if (!first) out += ',';
+            first = false;
+            out += frames[i];
+        }
+        return out + "]";
     }
 };
 
@@ -214,6 +241,9 @@ bool CaptureServer::serveDashboard(std::uint16_t port, std::string* err) {
     s->get("/", page);
     s->get("/home_dashboard.html", page);
     s->get("/api/captures", [im](const Request& q, Reply& r) { r.json(im->historySigned(limitParam(q, 100))); });
+    s->get("/api/ws", [im](const Request& q, Reply& r) {
+        r.json(im->sh->frameHistory(limitParam(q, 200)));
+    });
     s->post("/api/verify", [im](const Request& q, Reply& r) { r.json(im->verifyJson(q.body)); });
     s->get("/api/status", [im](const Request&, Reply& r) {
         std::string j = "{\"version\":\"";
@@ -235,6 +265,10 @@ bool CaptureServer::serveDashboard(std::uint16_t port, std::string* err) {
 void CaptureServer::expose(const std::string& htmlPath) {
     std::lock_guard<std::mutex> lk(p_->fileMu);
     p_->exposed = htmlPath;
+}
+
+void CaptureServer::broadcastFrame(const std::string& json) {
+    p_->sh->onFrame(json);
 }
 
 std::uint16_t CaptureServer::rawPort() const       { return p_->pRaw; }

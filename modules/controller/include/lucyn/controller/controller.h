@@ -88,6 +88,16 @@ struct ControllerOptions {
     // browser, so the next visit simply navigates the window there.
     std::string startUrl;
 
+    // Local file overrides (nothing-data/overrides/)
+    bool overridesEnabled = true;       // check nothing-data/overrides/ for local replacements
+    bool autoDeobfOverrides = false;    // auto-override with artifacts/*.deobf.js if present
+    std::string overridesDir;           // empty = default nothing-data/overrides/
+
+    // ----- WebSocket interception -----
+    bool wsInterceptEnabled = true;    // --ws-intercept
+    size_t wsMaxBytes = 1 << 20;       // --ws-max-bytes (1 MiB default)
+    std::string wsDir;                 // --ws-dir (optional persistence directory)
+
     // Custom in/out streams for testing. Null = use stdin/stdout.
     std::istream* in  = nullptr;
     std::ostream* out = nullptr;

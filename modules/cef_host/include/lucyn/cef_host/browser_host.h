@@ -29,6 +29,9 @@ struct BrowserOptions {
     bool javascript  = true;
     bool images      = true;
     bool followRedirects = true;
+    bool overridesEnabled = true;     // check nothing-data/overrides/ for local replacements
+    bool autoDeobfOverrides = false;  // auto-override with artifacts/*.deobf.js if present
+    std::string overridesDir;         // empty = default nothing-data/overrides
 };
 
 // One scraping instance. Create up to ~4 of these per process.
@@ -137,6 +140,26 @@ public:
     using ResourceHandler = std::function<void(const ResourceEvent&)>;
     void setResourceHandler(ResourceHandler h);
 
+    // ---- WebSocket frame feed ------------------------------------------------
+    // Chromium does not expose WebSocket frames to the browser process (they are
+    // not HTTP resources and never pass through a CefResourceFilter), so cef_host
+    // taps them in the renderer: the page's global WebSocket constructor/send is
+    // wrapped, and every frame the page sends or receives is reported up as one
+    // WsFrameEvent. The wrapper is transparent to the page (it returns the real
+    // socket, same prototype, same constants) and never blocks or reorders data.
+    // Like the resource handler these arrive DIRECTLY on the CEF thread that
+    // produced them — keep the handler quick and never block.
+    struct WsFrameEvent {
+        std::string direction;  // "in" (server -> page) or "out" (page -> server)
+        std::string url;        // the socket URL the page opened
+        std::string type;       // "text", "binary" or "other"
+        std::string data;       // text frames verbatim; binary frames a short hex preview
+        long long   bytes = 0;  // true frame size (characters for text when known)
+        bool        truncated = false;
+    };
+    using WsFrameHandler = std::function<void(const WsFrameEvent&)>;
+    void setWsFrameHandler(WsFrameHandler h);
+
     // Engine messages meant for a human ("downloaded <file> into ..."). Called
     // DIRECTLY on the CEF callback thread that produced them — keep the handler
     // quick and never block. nullptr (the default) drops them.
@@ -161,6 +184,11 @@ public:
     void setCookie(const std::string& url, const Cookie& c, ResultCallback cb);
     // Delete every cookie. ResultCallback::value is the number deleted (as text).
     void clearCookies(ResultCallback cb);
+
+    // ---- Local Overrides -----------------------------------------------------
+    void setOverridesEnabled(bool on);
+    void setAutoDeobfOverrides(bool on);
+    void setOverridesDir(const std::string& dir);
 
     // Drain pending callbacks queued by CEF threads and run them. Call from your loop.
     void pump();

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LucyN WebSocket Test</title>
+<style>
+  body { font: 14px monospace; background: #0b0d10; color: #d7dde4; padding: 20px; }
+  button { font: inherit; background: #12161b; color: #b392f0; border: 1px solid #222a33;
+           border-radius: 4px; padding: 6px 14px; cursor: pointer; margin: 4px; }
+  button:hover { border-color: #b392f0; }
+  #log { margin-top: 16px; border: 1px solid #222a33; padding: 10px; border-radius: 4px;
+         height: 300px; overflow: auto; font-size: 12px; }
+  .in  { color: #3fb950; } /* green  = received  */
+  .out { color: #58a6ff; } /* blue   = sent      */
+  .err { color: #f85149; } /* red    = error     */
+  .sys { color: #7d8793; } /* grey   = system    */
+  #status { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h2>🕷️ LucyN WebSocket Interceptor Test</h2>
+<div id="status">Not connected</div>
+
+<button onclick="connectPublic()">Connect → wss://echo.websocket.org</button>
+<button onclick="connectLocal()">Connect → ws://localhost:8765 (local)</button>
+<button onclick="sendText()">Send text frame</button>
+<button onclick="sendBinary()">Send binary frame</button>
+<button onclick="sendBurst()">Burst (10 frames)</button>
+<button onclick="disconnect()">Disconnect</button>
+<button onclick="clearLog()">Clear log</button>
+
+<div id="log"></div>
+
+<script>
+"use strict";
+var ws = null;
+
+function log(cls, msg) {
+  var d = document.getElementById("log");
+  var line = document.createElement("div");
+  line.className = cls;
+  line.textContent = new Date().toISOString().slice(11,23) + "  " + msg;
+  d.appendChild(line);
+  d.scrollTop = d.scrollHeight;
+}
+
+function status(msg) {
+  document.getElementById("status").textContent = msg;
+}
+
+function connectPublic() {
+  connect("wss://echo.websocket.org");
+}
+
+function connectLocal() {
+  connect("ws://localhost:8765");
+}
+
+function connect(url) {
+  if (ws) { ws.close(); ws = null; }
+  log("sys", "Connecting to " + url + " …");
+  status("Connecting…");
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = function () {
+    status("✅ Connected to " + url);
+    log("sys", "Connection opened");
+    // Auto-send a hello so the echo server bounces it back immediately
+    ws.send(JSON.stringify({ event: "hello", from: "LucyN WS test", ts: Date.now() }));
+    log("out", "→ auto-hello sent");
+  };
+
+  ws.onmessage = function (ev) {
+    if (typeof ev.data === "string") {
+      log("in", "← text (" + ev.data.length + " bytes): " + ev.data.slice(0, 120));
+    } else {
+      var arr = new Uint8Array(ev.data);
+      log("in", "← binary (" + arr.length + " bytes): " + Array.from(arr.slice(0,16)).map(function(b){return b.toString(16).padStart(2,"0");}).join(" ") + (arr.length > 16 ? " …" : ""));
+    }
+  };
+
+  ws.onerror = function (e) {
+    log("err", "Error (see browser console)");
+    status("❌ Error");
+  };
+
+  ws.onclose = function (ev) {
+    status("Disconnected (code " + ev.code + ")");
+    log("sys", "Connection closed: code=" + ev.code + " reason=" + (ev.reason || "(none)"));
+    ws = null;
+  };
+}
+
+function sendText() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log("err", "Not connected"); return; }
+  var msg = JSON.stringify({ event: "ping", ts: Date.now(), secret: "X-Bogus-" + Math.random().toString(36).slice(2) });
+  ws.send(msg);
+  log("out", "→ text (" + msg.length + " bytes): " + msg.slice(0, 100));
+}
+
+function sendBinary() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log("err", "Not connected"); return; }
+  // 32 random bytes
+  var buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  ws.send(buf.buffer);
+  log("out", "→ binary (32 bytes): " + Array.from(buf.slice(0,8)).map(function(b){return b.toString(16).padStart(2,"0");}).join(" ") + " …");
+}
+
+function sendBurst() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log("err", "Not connected"); return; }
+  for (var i = 0; i < 10; i++) {
+    (function(n) {
+      setTimeout(function() {
+        var msg = JSON.stringify({ frame: n, ts: Date.now() });
+        ws.send(msg);
+        log("out", "→ burst frame " + n + ": " + msg);
+      }, n * 100);
+    })(i);
+  }
+}
+
+function disconnect() {
+  if (ws) { ws.close(1000, "user closed"); ws = null; }
+}
+
+function clearLog() {
+  document.getElementById("log").textContent = "";
+}
+</script>
+</body>
+</html>
+

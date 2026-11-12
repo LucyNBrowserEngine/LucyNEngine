@@ -223,6 +223,30 @@ static void test_moonbug_servers_via_command() {
 
 #endif
 
+static void test_overrides_commands() {
+    auto r1 = run1("{\"id\":10,\"cmd\":\"override\",\"url\":\"https://example.com/app.js\",\"content\":\"console.log('test');\"}");
+    assert(r1.find("\"ok\":true") != std::string::npos);
+    assert(r1.find("example.com__app.js") != std::string::npos);
+
+    auto r2 = run1("{\"id\":11,\"cmd\":\"listOverrides\"}");
+    assert(r2.find("\"ok\":true") != std::string::npos);
+    assert(r2.find("example.com__app.js") != std::string::npos);
+
+    auto r3 = run1("{\"id\":12,\"cmd\":\"setOverrides\",\"enabled\":false,\"autoDeobf\":true}");
+    assert(r3.find("\"ok\":true") != std::string::npos);
+    assert(r3.find("\"enabled\":false") != std::string::npos);
+    assert(r3.find("\"autoDeobf\":true") != std::string::npos);
+
+    auto r4 = run1("{\"id\":13,\"cmd\":\"clearOverride\",\"url\":\"https://example.com/app.js\"}");
+    assert(r4.find("\"ok\":true") != std::string::npos);
+
+    auto r5 = run1("{\"id\":14,\"cmd\":\"listOverrides\"}");
+    assert(r5.find("\"ok\":true") != std::string::npos);
+    assert(r5.find("example.com__app.js") == std::string::npos);
+
+    std::puts("PASS: overrides_commands");
+}
+
 
 int main() {
     test_unknown_command();
@@ -238,6 +262,7 @@ int main() {
     test_json_escape_in_error();
     test_windows_line_ending();
     test_eof_clean_exit();
+    test_overrides_commands();
 #ifndef _WIN32
     test_moonbug_servers_via_command();
     if (g_fail5) { std::fprintf(stderr, "%d M5 check(s) FAILED\n", g_fail5); return 1; }

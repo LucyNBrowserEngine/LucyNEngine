@@ -86,35 +86,124 @@ Each save is announced in the log:
 Images and fonts are not written to disk (they stay headers-only in Moonbug); user-triggered
 downloads still land in `nothing-data/downloads/`.
 
-## Install
+## Live Overrides (`nothing-data/overrides/`)
 
-### Option A — just run it (prebuilt)
-
-Every **`V*.*.*`** tag (capital V) publishes a **self-contained** Linux tarball on the Releases
-page. Capital V is deliberate: lowercase `v*.*.*` tags publish the `@lucyn/browser` package to
-JSR, which accepts each version exactly once, while `V*.*.*` only builds binaries — so a broken
-binary build can be re-run or re-pushed as often as it needs without the registry refusing the
-version. Push both tags to ship both artifacts.
-
-The tarball already contains the binary *and* the whole Chromium runtime — nothing else to install:
-
-```bash
-tar -xzf lucyn-linux-x64.tar.gz
-./lucyn                     # starts headful; lucyn --listen opens the listening window
-```
-
-The tarball layout is exactly the layout the binary needs:
+LucyN does not just let you study saved files; it lets you **run modified code live in the browser**.
+Place any replacement file in **`nothing-data/overrides/`**:
 
 ```text
-lucyn              # the engine binary (rpath = $ORIGIN/cef)
-cef/               # Chromium runtime: libcef.so, icudtl.dat, *.pak, locales/
-adblock-filters/   # default filter lists, read from next to the binary
-scripts/           # install.sh / update_cef.sh, for rebuilding later
+nothing-data/overrides/
+  example.com__app.js              # flat artifact naming
+  example.com/static/js/app.js     # or hierarchical directory mirror
 ```
 
-Copy the folder around as one unit — a `lucyn` separated from its `cef/` folder cannot start.
+When Chromium loads resources:
+- If a matching file exists in `nothing-data/overrides/`, LucyN's C++ handler intercepts the request before it hits the network and serves your local replacement with permissive CORS headers.
+- **`--override-deobf`**: Passing this flag tells LucyN to automatically serve the deobfuscated sibling (`artifacts/*__*.deobf.js`) for any script that was deobfuscated.
+- **`--no-overrides`**: Disable all local file overrides.
+- **JSON commands**: Tools and scripts can also manage overrides dynamically over stdin/stdout:
+  - `{"cmd":"override", "url":"https://example.com/app.js", "content":"console.log(1);"}`
+  - `{"cmd":"clearOverride", "url":"https://example.com/app.js"}`
+  - `{"cmd":"listOverrides"}`
+  - `{"cmd":"setOverrides", "enabled":true, "autoDeobf":true}`
 
-### Option B — build from source
+## No new windows, ever
+
+LucyN has exactly one window and exactly one browser. **Nothing a page does can open a second
+one** — not `window.open()`, not `<a target="_blank">`, not `target="_new"`, not a middle-click,
+not a script that tries all of them in a loop. Every one of those requests goes through Chromium's
+popup gate (`CefLifeSpanHandler::OnBeforePopup`), which is refused before a browser or window
+comes into existence; if one ever slipped through another path, the stray browser is closed on
+sight. Blocked attempts are reported in the log:
+
+```text
+[INFO] ℹ️ 🚫 blocked new window: https://ads.example/popup
+```
+
+This is deliberate. It kills the most common ad and redirect-popup trick, and it also means a
+genuine site's "open in a new window" link simply does nothing — LucyN is a wiretap, not a tab
+zoo, and a second window would be a second surface nobody is watching. Navigate in the one window
+instead: `visit`, `click`, or the listen-mode URL bar.
+
+## WebSocket frames
+
+Moonbug records the **handshake and the frames** of every WebSocket the page opens (`ws://` and
+`wss://`) — WhatsApp Web, chat widgets, live dashboards, socket.io apps. Chromium never hands
+WebSocket frames to the browser process (they are a stream, not an HTTP resource), so the engine
+taps them in the renderer: the page's `WebSocket` constructor and `send()` are wrapped
+passively, and every frame the page sends or receives is reported up to Moonbug. The wrapper
+returns the real socket with the real prototype, so the page cannot tell the difference and no
+frame is ever delayed, reordered or rewritten.
+
+- **in** and **out** frames, text verbatim and binary as a short hex preview plus the byte count,
+  capped at `--ws-max-bytes` (1 MiB default) per frame.
+- The dashboard's **WebSocket** tab shows them live; `GET /api/ws?limit=N` serves the recent ones
+  and the raw stream (`ws://127.0.0.1:2005/stream`) carries them as
+  `{"event":"wsFrame",...}` lines next to the HTTP captures.
+- `--ws-intercept` (on by default), `--ws-max-bytes <n>`, and `--ws-dir <path>` to also append
+  every frame as JSONL to `<path>/ws-frames.jsonl`.
+
+Frames are not sealed with NULLBYTE: a seal attests an HTTP request/response pair, and a frame
+has neither. They are observational data like the rest of the wiretap.
+
+One honest limit: the tap runs in the page context of every frame, so a socket a page opens in a
+**Web Worker** or **Service Worker** is outside what CEF exposes to the engine and its frames are
+not captured.
+
+## Install
+
+### Releases are source only — you build it yourself
+
+> **Using LucyN needs you to build it on your machine.** We have no servers that can build LucyN
+> for you, let alone host the builds. The reason is CEF: the Chromium Embedded Framework
+> distribution is about **1.5 GB per platform** and **3+ GB unpacked**, which is too big for
+> GitHub Actions and far too big for us to publish for every OS and CPU architecture.
+
+So a **`V*.*.*`** tag (capital V) publishes exactly two files on the Releases page, and nothing is
+compiled by CI:
+
+```text
+LucyN-<version>-source.zip   # the source tree at that tag — no CEF, no build output
+release.json                 # version, the CEF build it expects, and the download URL
+```
+
+Capital V is deliberate: lowercase `v*.*.*` tags publish the `@lucyn/browser` package to JSR,
+which accepts each version exactly once, while `V*.*.*` only cuts a source release — so a broken
+release can be re-pushed as often as it needs without the registry refusing the version.
+
+Each release states the CEF build it expects. Builds are verified against one CEF build and the
+runtime next to the binary must be **that same version** (see [CEF versions](#cef-versions)).
+
+### What version am I looking at?
+
+`release.json` at the repo root is the machine-readable answer, and it is refreshed on `main` by
+every source release. Ping it and you get the current version, the CEF build it needs, and where
+to download the source:
+
+```bash
+curl -s https://raw.githubusercontent.com/LucyNBrowserEngine/LucyNEngine/main/release.json
+```
+
+```json
+{
+  "name": "LucyN",
+  "version": "1.0.1",
+  "cef_version": "156.0.7+g47dbc1d+chromium-156.0.8078.17",
+  "cef_build": "3652",
+  "chromium_version": "156.0.8078.17",
+  "requires_local_build": true,
+  "notice": "USING LUCYN REQUIRES YOU TO BUILD IT ON YOUR OWN MACHINE. …",
+  "download_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/releases/download/V1.0.1/LucyN-1.0.1-source.zip",
+  "source_archive_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/archive/refs/tags/V1.0.1.zip",
+  "release_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/releases/tag/V1.0.1",
+  "docs_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/blob/main/docs/building.md"
+}
+```
+
+`download_url` is the release attachment; `source_archive_url` is GitHub's own archive of the tag
+and always works, even for tags cut before source-only releases existed.
+
+### Build it
 
 You need a C++17 compiler, CMake ≥ 3.16, python3, and the CEF (Chromium) binary distribution —
 about 1.5 GB, downloaded for you.

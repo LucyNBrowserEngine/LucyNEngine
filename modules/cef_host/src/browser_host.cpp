@@ -26,6 +26,7 @@
 #include "include/cef_cookie.h"
 #include "include/cef_display_handler.h"
 #include "include/cef_download_handler.h"   // page-triggered downloads -> nothing-data/downloads
+#include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_navigation_entry.h"   // title of the navigation that is visible
 #include "include/cef_process_message.h"
@@ -41,6 +42,9 @@
 #include "include/cef_v8.h"
 #include "include/cef_version.h"
 #include "include/cef_version_info.h"  // cef_version_info(): run-time version of the libcef we loaded
+#include "include/cef_stream.h"
+#include "include/wrapper/cef_stream_resource_handler.h"
+#include "lucyn/core/overrides.h"
 #include "include/internal/cef_types.h"
 #include "include/internal/cef_time.h"      // cef_time_from_timet / _to_basetime
 #include "include/base/cef_callback.h"      // defines base::BindOnce
@@ -65,6 +69,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -204,6 +209,20 @@ struct SharedState {
     // Engine notes ("downloaded X"): same rules as resourceHandler — called
     // DIRECTLY on the CEF thread that produced them. Guarded by mu.
     std::function<void(const std::string&)> noteHandler;  // guarded by mu
+
+    // WebSocket frames tapped in the renderer (setWsFrameHandler). Called
+    // directly on the CEF thread that delivered the process message.
+    std::function<void(const BrowserInstance::WsFrameEvent&)> wsFrameHandler;  // guarded by mu
+
+    // The identifier of the ONE browser this instance owns. Every other browser
+    // CEF ever creates for it (a popup, a target=_blank tab, a devtools window)
+    // is closed on sight: LucyN never opens a new window. Guarded by mu.
+    int browserId = 0;
+
+    // Local file overrides (nothing-data/overrides/)
+    bool overridesEnabled = true;     // guarded by mu
+    bool autoDeobfOverrides = false;  // guarded by mu
+    std::string overridesDir;         // guarded by mu
 
     // Latest painted frame, BGRA, guarded by paintMu. Screenshot reads it.
     std::mutex paintMu;
@@ -430,6 +449,88 @@ public:
     explicit LucynResourceRequestHandler(std::shared_ptr<SharedState> state)
         : state_(std::move(state)) {}
 
+    // Local file overrides: before sending to the network, check if an override
+    // exists in nothing-data/overrides/ (or artifacts/*.deobf.js if autoDeobf).
+    // If found, serve the local file via CefStreamResourceHandler.
+    CefRefPtr<CefResourceHandler> GetResourceHandler(CefRefPtr<CefBrowser>,
+                                                     CefRefPtr<CefFrame>,
+                                                     CefRefPtr<CefRequest> request) override {
+        const std::string url = request->GetURL().ToString();
+        if (core::isPseudoUrl(url)) return nullptr;
+
+        core::OverrideOptions opts;
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            opts.enabled = state_->overridesEnabled;
+            opts.autoDeobf = state_->autoDeobfOverrides;
+            opts.customDir = state_->overridesDir;
+        }
+        if (!opts.enabled) return nullptr;
+
+        const std::string overridePath = core::findOverrideFile(url, opts);
+        if (overridePath.empty()) return nullptr;
+
+        std::ifstream file(overridePath, std::ios::binary);
+        if (!file) return nullptr;
+        std::string content((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+        file.close();
+
+        const std::string mime = core::mimeTypeForPath(overridePath);
+        CefRefPtr<CefStreamReader> stream =
+            CefStreamReader::CreateForData(
+                static_cast<void*>(content.data()), content.size());
+        if (!stream) return nullptr;
+
+        CefResponse::HeaderMap headers;
+        headers.emplace("Access-Control-Allow-Origin", "*");
+        headers.emplace("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        headers.emplace("Access-Control-Allow-Headers", "*");
+        headers.emplace("Cache-Control", "no-cache, no-store, must-revalidate");
+        headers.emplace("X-Lucyn-Override", "1");
+
+        CefRefPtr<CefStreamResourceHandler> handler =
+            new CefStreamResourceHandler(200, "OK", mime, headers, stream);
+
+        overriddenRequests_.insert(request->GetIdentifier());
+
+        // Announce override to logger/notes
+        {
+            std::function<void(const std::string&)> noteH;
+            {
+                std::lock_guard<std::mutex> lock(state_->mu);
+                noteH = state_->noteHandler;
+            }
+            if (noteH) {
+                namespace fs = std::filesystem;
+                noteH("⚡ override applied: " + fs::path(overridePath).filename().string() + " → " + url);
+            }
+        }
+
+        // Deliver body event to Moonbug
+        {
+            std::function<void(const BrowserInstance::ResourceEvent&)> resH;
+            {
+                std::lock_guard<std::mutex> lock(state_->mu);
+                resH = state_->resourceHandler;
+            }
+            if (resH) {
+                BrowserInstance::ResourceEvent ev;
+                ev.phase = BrowserInstance::ResourceEvent::Body;
+                ev.requestId = request->GetIdentifier();
+                ev.url = url;
+                ev.method = request->GetMethod().ToString();
+                ev.contentType = mime;
+                ev.bytes = static_cast<long long>(content.size());
+                ev.body = std::move(content);
+                ev.bodyTruncated = false;
+                resH(ev);
+            }
+        }
+
+        return handler;
+    }
+
     // Body capture: called on the IO thread just before the response streams to
     // the renderer. We buffer only what is worth keeping as text/code — images,
     // fonts and media get no filter at all (zero overhead for them) — and register
@@ -440,6 +541,9 @@ public:
                                                            CefRefPtr<CefResponse> response) override {
         const std::string reqUrl = request->GetURL().ToString();
         if (core::isPseudoUrl(reqUrl)) return nullptr;
+        if (overriddenRequests_.find(request->GetIdentifier()) != overriddenRequests_.end()) {
+            return nullptr;
+        }
         const std::string respUrl =
             response ? response->GetURL().ToString() : std::string();
         const std::string finalUrl = respUrl.empty() ? reqUrl : respUrl;
@@ -493,6 +597,7 @@ public:
                                 int64_t received_content_length) override {
         // Flush the response body BEFORE the Finish event goes out: the controller
         // parks a Body that precedes its Finish and merges it into the capture.
+        overriddenRequests_.erase(request->GetIdentifier());
         {
             auto it = filters_.find(request->GetIdentifier());
             if (it != filters_.end()) {
@@ -535,6 +640,7 @@ private:
     std::shared_ptr<SharedState> state_;
     // requestId -> the body filter installed for that response. IO thread only.
     std::map<unsigned long long, CefRefPtr<LucynBodyFilter>> filters_;
+    std::set<unsigned long long> overriddenRequests_;
     IMPLEMENT_REFCOUNTING(LucynResourceRequestHandler);
     DISALLOW_COPY_AND_ASSIGN(LucynResourceRequestHandler);
 };
@@ -675,6 +781,117 @@ static const char kNetTapJs[] = R"LUCYNJS(
       return origSend.apply(this, arguments);
     };
   }
+})();
+)LUCYNJS";
+
+// ---------------------------------------------------------------------------
+// LucynWsTapHandler + kWsTapJs — WebSocket frame capture.
+//
+// There is no browser-process API for WebSocket frames: a ws:// connection is a
+// stream, not an HTTP resource, so neither OnBeforeResourceLoad nor a response
+// filter sees the frames. The only place the bytes are readable is the renderer,
+// so the page's WebSocket constructor and send() are wrapped there and every
+// frame is reported up as a "lucyn.ws.frame" process message.
+//
+// The wrapper must be invisible to the page: it returns the real socket object,
+// keeps the real prototype (instanceof works), copies CONNECTING/OPEN/CLOSING/
+// CLOSED, and only adds a passive listener plus an own send() that forwards
+// straight through. Nothing is ever delayed or rewritten.
+// ---------------------------------------------------------------------------
+class LucynWsTapHandler : public CefV8Handler {
+public:
+    LucynWsTapHandler() = default;
+
+    bool Execute(const CefString& name,
+                 CefRefPtr<CefV8Value>,
+                 const CefV8ValueList& arguments,
+                 CefRefPtr<CefV8Value>& retval,
+                 CefString&) override {
+        retval = CefV8Value::CreateBool(false);
+        if (name != "lucynWsTap" || arguments.size() < 6) return true;
+        CefRefPtr<CefV8Context> ctx = CefV8Context::GetCurrentContext();
+        CefRefPtr<CefFrame> frame = ctx ? ctx->GetFrame() : nullptr;
+        if (!frame) return true;
+        auto str = [&](size_t i) {
+            return arguments[i]->IsString() ? arguments[i]->GetStringValue() : CefString();
+        };
+        CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("lucyn.ws.frame");
+        CefRefPtr<CefListValue> a = msg->GetArgumentList();
+        a->SetString(0, str(0));   // direction: "in" | "out"
+        a->SetString(1, str(1));   // socket url
+        a->SetString(2, str(2));   // type: "text" | "binary" | "other"
+        a->SetString(3, str(3));   // data (text or a binary preview)
+        const bool numeric = arguments[4]->IsInt() || arguments[4]->IsUInt() || arguments[4]->IsDouble();
+        a->SetDouble(4, numeric ? arguments[4]->GetDoubleValue() : 0);
+        a->SetInt(5, arguments[5]->IsBool() && arguments[5]->GetBoolValue() ? 1 : 0);
+        frame->SendProcessMessage(PID_BROWSER, msg);
+        retval = CefV8Value::CreateBool(true);
+        return true;
+    }
+
+private:
+    IMPLEMENT_REFCOUNTING(LucynWsTapHandler);
+    DISALLOW_COPY_AND_ASSIGN(LucynWsTapHandler);
+};
+
+static const char kWsTapJs[] = R"LUCYNJS(
+(function () {
+  if (window.__lucynWsTap) return;
+  window.__lucynWsTap = 1;
+  var Native = window.WebSocket;
+  if (typeof Native !== "function") return;
+  var MAX = 512 * 1024;            // characters of a text frame kept for the capture
+
+  function report(dir, url, type, data, bytes, truncated) {
+    try { window.lucynWsTap(dir, String(url || ""), type, String(data || ""), bytes | 0, truncated ? 1 : 0); } catch (e) {}
+  }
+  function clip(t) { return t.length > MAX ? t.slice(0, MAX) : t; }
+  function describe(d) {
+    try {
+      if (typeof d === "string") return { type: "text", text: d, bytes: d.length };
+      if (typeof Blob !== "undefined" && d instanceof Blob)
+        return { type: "binary", text: "[Blob " + d.size + " bytes]", bytes: d.size };
+      if (d && d.byteLength !== undefined) {
+        var view = new Uint8Array(d.buffer || d, d.byteOffset || 0, d.byteLength);
+        var hex = "";
+        for (var i = 0; i < view.length && i < 64; ++i) hex += (view[i] < 16 ? "0" : "") + view[i].toString(16) + " ";
+        return { type: "binary", text: "[binary " + view.length + " bytes] " + hex, bytes: view.length };
+      }
+      return { type: "other", text: String(d), bytes: 0 };
+    } catch (e) { return { type: "other", text: "", bytes: 0 }; }
+  }
+
+  function Wrapped(url, protocols) {
+    var sock = arguments.length > 1 ? new Native(url, protocols) : new Native(url);
+    try {
+      var target = String(url || "");
+      sock.addEventListener("message", function (ev) {
+        var d = describe(ev.data);
+        report("in", target, d.type, clip(d.text), d.bytes, d.text.length > MAX);
+      });
+      var origSend = sock.send;
+      sock.send = function (data) {
+        try {
+          var d = describe(data);
+          report("out", target, d.type, clip(d.text), d.bytes, d.text.length > MAX);
+        } catch (e) {}
+        return origSend.apply(sock, arguments);
+      };
+    } catch (e) {}
+    return sock;
+  }
+
+  // Stay indistinguishable from the native constructor.
+  Wrapped.prototype = Native.prototype;
+  ["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach(function (k) {
+    if (k in Native) Wrapped[k] = Native[k];
+  });
+  try { Wrapped.toString = function () { return Native.toString(); }; } catch (e) {}
+  try {
+    Object.defineProperty(window, "WebSocket", {
+      value: Wrapped, writable: true, configurable: true, enumerable: false
+    });
+  } catch (e) { try { window.WebSocket = Wrapped; } catch (e2) {} }
 })();
 )LUCYNJS";
 
@@ -956,6 +1173,7 @@ static const char kListenBarJs[] = R"LUCYNJS(
 // engine calls back into. Holds a shared_ptr to SharedState, never a raw Impl*.
 // ---------------------------------------------------------------------------
 class LucynClient : public CefClient,
+                    public CefLifeSpanHandler,
                     public CefLoadHandler,
                     public CefDisplayHandler,
                     public CefRenderHandler,
@@ -975,6 +1193,51 @@ public:
     // Without this CEF hands page-triggered downloads to Chromium's default
     // handling (a file dropped in ~/Downloads or the working directory).
     CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return downloadHandler_; }
+    CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+
+    // -- CefLifeSpanHandler: no new windows, ever ----------------------------
+    // Returning true refuses the popup before any browser/window is created.
+    // This is the one gate that covers window.open(), <a target="_blank">,
+    // target="_new" frames and middle-click "open in new tab": every one of
+    // those arrives here. Ads cannot spawn a window, and neither can a genuine
+    // site's "open in a new window" link — LucyN is a wiretap, not a tab zoo,
+    // and a second window would be a second surface nobody is watching.
+    bool OnBeforePopup(CefRefPtr<CefBrowser>,
+                       CefRefPtr<CefFrame>,
+                       int,
+                       const CefString& target_url,
+                       const CefString&,
+                       CefLifeSpanHandler::WindowOpenDisposition,
+                       bool,
+                       const CefPopupFeatures&,
+                       CefWindowInfo&,
+                       CefRefPtr<CefClient>&,
+                       CefBrowserSettings&,
+                       CefRefPtr<CefDictionaryValue>&,
+                       bool*) override {
+        const std::string url = target_url.ToString();
+        std::function<void(const std::string&)> h;
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            h = state_->noteHandler;
+        }
+        if (h) h("\xF0\x9F\x9A\xAB blocked new window: " + (url.empty() ? std::string("(no url)") : url));
+        return true;   // true = do not create it
+    }
+
+    // Belt and braces: if a browser is ever created by another path (a popup that
+    // slipped past the gate, a devtools window), close it immediately. Only the
+    // first browser — the one BrowserInstance owns — is allowed to live.
+    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+        if (!browser) return;
+        bool stray = false;
+        {
+            std::lock_guard<std::mutex> lock(state_->mu);
+            if (state_->browserId == 0) state_->browserId = browser->GetIdentifier();
+            stray = state_->browserId != browser->GetIdentifier();
+        }
+        if (stray) browser->GetHost()->CloseBrowser(true);
+    }
 
     // Provide the resource observer that drives Moonbug. Returning a non-null
     // handler here is what makes OnBeforeResourceLoad / OnResourceLoadComplete fire.
@@ -1129,6 +1392,25 @@ public:
             if (h) h(ev);
             return true;
         }
+        if (name == "lucyn.ws.frame") {
+            // A WebSocket frame the page sent or received (kWsTapJs). Hand it to
+            // the controller's Moonbug tap like a resource event.
+            CefRefPtr<CefListValue> a = message->GetArgumentList();
+            BrowserInstance::WsFrameEvent ev;
+            ev.direction = a->GetString(0).ToString();
+            ev.url       = a->GetString(1).ToString();
+            ev.type      = a->GetString(2).ToString();
+            ev.data      = a->GetString(3).ToString();
+            ev.bytes     = static_cast<long long>(a->GetDouble(4));
+            ev.truncated = a->GetInt(5) != 0;
+            std::function<void(const BrowserInstance::WsFrameEvent&)> h;
+            {
+                std::lock_guard<std::mutex> lock(state_->mu);
+                h = state_->wsFrameHandler;
+            }
+            if (h) h(ev);
+            return true;
+        }
         if (name != "lucyn.eval.result") return false;
         CefRefPtr<CefListValue> args = message->GetArgumentList();
         const int reqId = args->GetInt(0);
@@ -1231,6 +1513,7 @@ public:
                           CefRefPtr<CefV8Context> context) override {
         if (frame->IsMain()) contexts_[browser->GetIdentifier()] = context;
         installNetTap(frame, context);
+        installWsTap(frame, context);
     }
 
     // Response-body tap: publish window.lucynNetTap (native sink) and run the
@@ -1251,6 +1534,23 @@ public:
         CefRefPtr<CefV8Value> rv;
         CefRefPtr<CefV8Exception> ex;
         context->Eval(kNetTapJs, frame ? frame->GetURL() : CefString("about:blank"), 0, rv, ex);
+    }
+
+    // WebSocket frame tap: publish window.lucynWsTap and wrap the page's
+    // WebSocket constructor/send before any page script runs. Same reasoning as
+    // installNetTap — frames never reach the browser process, so the renderer is
+    // the only place to see them.
+    void installWsTap(CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) {
+        if (!context || !context->IsValid()) return;
+        CefRefPtr<CefV8Value> global = context->GetGlobal();
+        if (!global || !global->IsValid()) return;
+        global->SetValue("lucynWsTap",
+                         CefV8Value::CreateFunction("lucynWsTap", new LucynWsTapHandler()),
+                         static_cast<CefV8Value::PropertyAttribute>(
+                             V8_PROPERTY_ATTRIBUTE_DONTDELETE | V8_PROPERTY_ATTRIBUTE_READONLY));
+        CefRefPtr<CefV8Value> rv;
+        CefRefPtr<CefV8Exception> ex;
+        context->Eval(kWsTapJs, frame ? frame->GetURL() : CefString("about:blank"), 0, rv, ex);
     }
 
     void OnContextReleased(CefRefPtr<CefBrowser> browser,
@@ -2007,6 +2307,9 @@ BrowserInstance::BrowserInstance(const BrowserOptions& opts) : impl_(new Impl())
     impl_->state  = std::make_shared<SharedState>();
     impl_->state->width  = opts.viewportWidth;
     impl_->state->height = opts.viewportHeight;
+    impl_->state->overridesEnabled   = opts.overridesEnabled;
+    impl_->state->autoDeobfOverrides = opts.autoDeobfOverrides;
+    impl_->state->overridesDir       = opts.overridesDir;
     impl_->client = new LucynClient(impl_->state);
 }
 
@@ -2201,6 +2504,12 @@ void BrowserInstance::setNoteHandler(NoteHandler h) {
     impl_->state->noteHandler = std::move(h);
 }
 
+void BrowserInstance::setWsFrameHandler(WsFrameHandler h) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->state->mu);
+    impl_->state->wsFrameHandler = std::move(h);
+}
+
 void BrowserInstance::allCookies(const std::string& url, CookieListCallback cb) {
     if (!impl_) { cb(false, {}, "instance gone"); return; }
     auto coll = std::make_shared<CookieCollect>();
@@ -2217,6 +2526,24 @@ void BrowserInstance::setCookie(const std::string& url, const Cookie& c, ResultC
 void BrowserInstance::clearCookies(ResultCallback cb) {
     if (!impl_) { cb(false, "", "instance gone"); return; }
     CefPostTask(TID_UI, base::BindOnce(&DoClearCookies, impl_->state, std::move(cb)));
+}
+
+void BrowserInstance::setOverridesEnabled(bool on) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->state->mu);
+    impl_->state->overridesEnabled = on;
+}
+
+void BrowserInstance::setAutoDeobfOverrides(bool on) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->state->mu);
+    impl_->state->autoDeobfOverrides = on;
+}
+
+void BrowserInstance::setOverridesDir(const std::string& dir) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->state->mu);
+    impl_->state->overridesDir = dir;
 }
 
 void BrowserInstance::pump() {

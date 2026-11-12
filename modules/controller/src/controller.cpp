@@ -5,6 +5,7 @@
 #include <lucyn/controller/controller.h>
 #include <lucyn/core/assets.h>          // isTextAsset / isScriptAsset / assetExtension
 #include <lucyn/core/paths.h>
+#include <lucyn/core/overrides.h>
 #include <lucyn/logger/logger.h>
 #include <lucyn/net/deobfuscate.h>      // the second view of a saved script
 #include <lucyn/net/moonbug.h>
@@ -340,11 +341,15 @@ struct Controller::Impl {
     net::Moonbug      moonbug;     // the wiretap
     std::atomic<bool> eventsOn{false};
     net::Moonbug::ListenerId  eventTap = 0;
+    core::OverrideOptions overrideOpts_;
 #ifdef LUCYN_CONTROLLER_HAVE_SEARCH
     lucyn::search::Registry searchEngines;
 #endif
 
     std::string lastUrl;
+    // WebSocket frame sink (--ws-dir): one JSON line per frame, guarded by wsMu.
+    std::mutex wsMu;
+    std::ofstream wsOut;
 #ifdef LUCYN_CONTROLLER_HAVE_CEF
     // Session 19: Chromium-backed instance for the six migrated commands (visit,
     // html, eval, extract, extractAll, click). Created only when the host process
@@ -491,6 +496,41 @@ struct Controller::Impl {
         emit(eventLine("note", msg));
     }
 
+    // ---- WebSocket frames (--ws-intercept) ----------------------------------
+    // Called DIRECTLY on the CEF thread that delivered the renderer message. The
+    // frame is capped, serialised as one {"event":"wsFrame",...} line and handed
+    // to the dashboard/raw stream (and optionally appended to --ws-dir).
+    void onCefWsFrame(const lucyn::cef_host::BrowserInstance::WsFrameEvent& f) {
+        if (!opts.wsInterceptEnabled) return;
+        std::string data = f.data;
+        bool truncated = f.truncated;
+        if (opts.wsMaxBytes > 0 && data.size() > opts.wsMaxBytes) {
+            data.resize(opts.wsMaxBytes);
+            truncated = true;
+        }
+        const long long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string json =
+            "{\"event\":\"wsFrame\",\"direction\":\"" + jsonEsc(f.direction) +
+            "\",\"url\":\"" + jsonEsc(f.url) +
+            "\",\"type\":\"" + jsonEsc(f.type) +
+            "\",\"data\":\"" + jsonEsc(data) +
+            "\",\"bytes\":" + std::to_string(f.bytes) +
+            ",\"truncated\":" + (truncated ? "true" : "false") +
+            ",\"ts\":" + std::to_string(ts) + "}";
+        if (srv) srv->broadcastFrame(json);
+        if (!opts.wsDir.empty()) {
+            std::lock_guard<std::mutex> lk(wsMu);
+            if (!wsOut.is_open()) {
+                std::error_code ec;
+                std::filesystem::create_directories(std::filesystem::u8path(opts.wsDir), ec);
+                wsOut.open(std::filesystem::u8path(opts.wsDir) / "ws-frames.jsonl",
+                           std::ios::binary | std::ios::app);
+            }
+            if (wsOut.is_open()) { wsOut << json << '\n'; wsOut.flush(); }
+        }
+    }
+
     // ---- artifact capture ----------------------------------------------------------------
 
     // Called from onCefResource (CEF IO thread): classify, dedupe and hand over.
@@ -546,37 +586,13 @@ struct Controller::Impl {
         const std::string dir = core::dataDir("artifacts");
         if (dir.empty()) return;
 
-        std::string host, path, base;
-        if (const std::size_t s = job.url.find("://"); s != std::string::npos) {
-            const std::size_t h = s + 3;
-            const std::size_t e = job.url.find('/', h);
-            host = (e == std::string::npos) ? job.url.substr(h) : job.url.substr(h, e - h);
-            path = (e == std::string::npos) ? std::string() : job.url.substr(e);
-        }
-        if (const std::size_t q = path.find_first_of("?#"); q != std::string::npos)
-            path = path.substr(0, q);
-        auto sanitize = [](std::string v, std::size_t maxLen) {
-            for (char& c : v) {
-                const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
-                if (!ok) c = '_';
-            }
-            if (v.size() > maxLen) v.resize(maxLen);
-            return v;
-        };
-        host = sanitize(host, 60);
-        base = sanitize(path.empty() ? std::string() : path.substr(path.find_last_of('/') + 1), 80);
-        if (base.empty()) base = "index";
-        if (base.find('.') == std::string::npos) {
-            const std::string ext = core::assetExtension(job.url, job.contentType);
-            base += ext.empty() ? ".txt" : ext;
-        }
+        const std::string rawName = core::assetFilename(job.url, job.contentType);
 
         fs::path p;
         std::string rel;
         for (int n = 0; ; ++n) {
             if (n > 40) return;   // hopeless collision storm: skip rather than spin
-            std::string name = host + "__" + base;
+            std::string name = rawName;
             if (n > 0) {
                 const std::size_t dot = name.find_last_of('.');
                 const std::string suffix = "~" + std::to_string(n);
@@ -677,16 +693,27 @@ struct Controller::Impl {
         adblocker.finalize();
         eventsOn = opts.captureEvents;
         eventTap = moonbug.onCapture([this](const net::Capture& c) { if (eventsOn) emit(requestEvent(c)); });
+        overrideOpts_.enabled = opts.overridesEnabled;
+        overrideOpts_.autoDeobf = opts.autoDeobfOverrides;
+        overrideOpts_.customDir = opts.overridesDir;
 #ifdef LUCYN_CONTROLLER_HAVE_CEF
         // Chromium instance — but ONLY when the host process initialised CEF. Unit
         // tests never do, so engine commands report "no page loaded" there.
         if (lucyn::cef_host::isCefInitialized()) {
-            cef_ = lucyn::cef_host::createInstance();
+            lucyn::cef_host::BrowserOptions bopts;
+            bopts.overridesEnabled   = opts.overridesEnabled;
+            bopts.autoDeobfOverrides = opts.autoDeobfOverrides;
+            bopts.overridesDir       = opts.overridesDir;
+            cef_ = lucyn::cef_host::createInstance(bopts);
             if (cef_) {
                 cef_->setResourceHandler([this](const lucyn::cef_host::BrowserInstance::ResourceEvent& ev) {
                     onCefResource(ev);
                 });
                 cef_->setNoteHandler([this](const std::string& msg) { onEngineNote(msg); });
+                if (opts.wsInterceptEnabled)
+                    cef_->setWsFrameHandler([this](const lucyn::cef_host::BrowserInstance::WsFrameEvent& f) {
+                        onCefWsFrame(f);
+                    });
             }
         }
         // Session cookies: load nothing-data/cookies.json into Chromium's jar — this is
@@ -711,6 +738,7 @@ struct Controller::Impl {
         if (artThread.joinable()) artThread.join();
         if (cef_) cef_->setResourceHandler(nullptr);   // stop IO-thread callbacks before members die
         if (cef_) cef_->setNoteHandler(nullptr);
+        if (cef_) cef_->setWsFrameHandler(nullptr);
 #endif
         saveCookiesJson();                     // clean shutdown: write Chromium's jar back to cookies.json
         srv.reset();                          // stop listeners first
@@ -1331,6 +1359,60 @@ struct Controller::Impl {
         return r;
     }
 
+    // ---- local overrides ----------------------------------------------------
+
+    std::string cmdOverride(long long id, const std::string& line) {
+        const std::string url = jsonGetStr(line, "url");
+        if (url.empty()) return replyErr(id, "'url' required");
+        const std::string content = jsonGetStr(line, "content");
+        if (!core::saveOverride(url, content, overrideOpts_)) {
+            return replyErr(id, "cannot save override for " + url);
+        }
+        std::string filename = core::assetFilename(url);
+        return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"file\":\"" + jsonEsc(filename) + "\"}";
+    }
+
+    std::string cmdClearOverride(long long id, const std::string& line) {
+        const std::string url = jsonGetStr(line, "url");
+        if (url.empty()) return replyErr(id, "'url' required");
+        core::clearOverride(url, overrideOpts_);
+        return replyOk(id);
+    }
+
+    std::string cmdListOverrides(long long id) {
+        auto list = core::listOverrides(overrideOpts_);
+        std::ostringstream out;
+        out << "{\"id\":" << id << ",\"ok\":true,\"overrides\":[";
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            if (i > 0) out << ",";
+            out << "{\"name\":\"" << jsonEsc(list[i].name) << "\",\"bytes\":" << list[i].size << "}";
+        }
+        out << "]}";
+        return out.str();
+    }
+
+    std::string cmdSetOverrides(long long id, const std::string& line) {
+        if (line.find("\"enabled\":false") != std::string::npos) {
+            overrideOpts_.enabled = false;
+        } else if (line.find("\"enabled\":true") != std::string::npos) {
+            overrideOpts_.enabled = true;
+        }
+        if (line.find("\"autoDeobf\":true") != std::string::npos) {
+            overrideOpts_.autoDeobf = true;
+        } else if (line.find("\"autoDeobf\":false") != std::string::npos) {
+            overrideOpts_.autoDeobf = false;
+        }
+#ifdef LUCYN_CONTROLLER_HAVE_CEF
+        if (cef_) {
+            cef_->setOverridesEnabled(overrideOpts_.enabled);
+            cef_->setAutoDeobfOverrides(overrideOpts_.autoDeobf);
+        }
+#endif
+        return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"enabled\":" +
+               (overrideOpts_.enabled ? "true" : "false") + ",\"autoDeobf\":" +
+               (overrideOpts_.autoDeobf ? "true" : "false") + "}";
+    }
+
     // ---- run loop -----------------------------------------------------------
 
     int run() {
@@ -1428,6 +1510,14 @@ struct Controller::Impl {
                 reply(cmdMoonbug(id, line));
             } else if (cmd == "captures") {
                 reply(cmdCaptures(id, jsonGetInt(line, "limit")));
+            } else if (cmd == "override") {
+                reply(cmdOverride(id, line));
+            } else if (cmd == "clearOverride") {
+                reply(cmdClearOverride(id, line));
+            } else if (cmd == "listOverrides") {
+                reply(cmdListOverrides(id));
+            } else if (cmd == "setOverrides") {
+                reply(cmdSetOverrides(id, line));
             } else {
                 reply(replyErr(id, "unknown command: " + cmd));
             }

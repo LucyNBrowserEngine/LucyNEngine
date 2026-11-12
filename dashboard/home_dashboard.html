@@ -25,7 +25,7 @@
   button:disabled { opacity: .45; cursor: default; }
   input { width: 230px; }
   .stat b { color: var(--accent); }
-  #layout { display: flex; height: calc(100% - 52px); }
+  #layout { display: flex; height: calc(100% - 52px - 34px); }
   #listwrap { flex: 1; overflow: auto; min-width: 0; }
   table { width: 100%; border-collapse: collapse; }
   th { position: sticky; top: 0; background: var(--panel); text-align: left; color: var(--dim);
@@ -54,6 +54,19 @@
   .row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
   #verdict { margin-left: 4px; }
   .close { float: right; }
+  /* ---- tabs ---- */
+  .tabs { display: flex; gap: 2px; padding: 0 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .tab-btn { background: none; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    color: var(--dim); padding: 7px 14px; cursor: pointer; font: inherit; }
+  .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+  .tab-pane { display: none; height: 100%; }
+  .tab-pane.active { display: flex; flex: 1; min-height: 0; }
+  /* ---- ws frames panel ---- */
+  #ws-wrap { flex: 1; overflow: auto; min-width: 0; }
+  .dir-in  { color: var(--ok); }
+  .dir-out { color: var(--info); }
+  td.payload { font-size: 11px; color: var(--dim); max-width: 500px; }
+  #ws-empty { padding: 40px 20px; color: var(--dim); text-align: center; }
 </style>
 </head>
 <body>
@@ -68,7 +81,13 @@
   <button id="verifyall">Verify all seals</button>
   <button id="clear">Clear</button>
 </header>
+<nav class="tabs">
+  <button class="tab-btn active" id="tab-http" onclick="switchTab('http')">HTTP</button>
+  <button class="tab-btn" id="tab-ws" onclick="switchTab('ws')">WebSocket <span id="ws-badge" style="display:none;font-size:10px;color:var(--accent)"></span></button>
+</nav>
 <div id="layout">
+  <!-- HTTP tab -->
+  <div class="tab-pane active" id="pane-http">
   <div id="listwrap">
     <table>
       <thead><tr><th>#</th><th>time</th><th>method</th><th>status</th><th>url</th><th>via</th><th>size</th><th>ms</th><th>seal</th></tr></thead>
@@ -77,6 +96,18 @@
     <div id="empty">No traffic yet. LucyN is being suspiciously quiet. Make her <code>visit</code> something.</div>
   </div>
   <aside id="detail" hidden></aside>
+  </div><!-- /pane-http -->
+
+  <!-- WebSocket tab -->
+  <div class="tab-pane" id="pane-ws">
+  <div id="ws-wrap">
+    <table>
+      <thead><tr><th>#</th><th>time</th><th>dir</th><th>type</th><th>url</th><th>data</th><th>bytes</th></tr></thead>
+      <tbody id="ws-rows"></tbody>
+    </table>
+    <div id="ws-empty">No WebSocket frames yet. Navigate to a site that uses WebSockets.</div>
+  </div>
+  </div><!-- /pane-ws -->
 </div>
 
 <script>
@@ -271,18 +302,86 @@
     }
   });
 
+  // ---------------------------------------------------------------- tab switching
+  var wsCount = 0;
+  window.switchTab = function (name) {
+    ["http", "ws"].forEach(function (t) {
+      $(("pane-" + t)).classList.toggle("active", t === name);
+      $(("tab-" + t)).classList.toggle("active", t === name);
+    });
+    if (name === "ws") { $(("ws-badge")).style.display = "none"; }
+  };
+
+  // ---------------------------------------------------------------- websocket frames
+  function ingestWsFrame(msg) {
+    var url = msg.url || "";
+    var dir = msg.direction || msg.dir || "?";
+    var type = msg.type || "text";
+    var data = msg.data || "";
+    var bytes = msg.bytes || 0;
+    var trunc = msg.truncated;
+    wsCount++;
+
+    $(("ws-empty")).hidden = true;
+    var tbody = $(("ws-rows"));
+    var tr = document.createElement("tr");
+
+    var preview = trunc ? data.slice(0, 120) + "…" : data.slice(0, 120) + (data.length > 120 ? "…" : "");
+
+    var cells = [
+      wsCount,
+      clock(Date.now()),
+      dir,
+      type,
+      shortUrl(url),
+      preview,
+      human(bytes)
+    ];
+    cells.forEach(function (c, i) {
+      var td = document.createElement("td");
+      if (i === 2) td.className = dir === "in" ? "dir-in" : "dir-out";
+      if (i === 5) td.className = "payload";
+      if (i === 4) { td.className = "url"; td.title = url; }
+      td.textContent = String(c);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+
+    // scroll to bottom if near bottom
+    var w = $(("ws-wrap"));
+    if (w.scrollTop + w.clientHeight >= w.scrollHeight - 40) w.scrollTop = w.scrollHeight;
+
+    // badge on tab if not active
+    if (!$(("tab-ws")).classList.contains("active")) {
+      var b = $(("ws-badge")); b.style.display = ""; b.textContent = "(" + wsCount + ")";
+    }
+  }
+
   // ---------------------------------------------------------------- transport
   function loadHistory() {
     var xhr = new XMLHttpRequest();
     xhr.open("GET", "/api/captures?limit=200");
     xhr.onload = function () { try { JSON.parse(xhr.responseText).forEach(function (env) { ingest(JSON.stringify(env)); }); } catch (e) {} };
     xhr.send();
+    // WebSocket frames are not captures: they have their own small history.
+    var wx = new XMLHttpRequest();
+    wx.open("GET", "/api/ws?limit=200");
+    wx.onload = function () { try { JSON.parse(wx.responseText).forEach(function (f) { ingestWsFrame(f); }); } catch (e) {} };
+    wx.send();
   }
   function connect() {
     var sock = new WebSocket("ws://" + location.host + "/stream");
     ws = sock;
     sock.onopen = function () { retry = 0; $("dot").className = "live"; $("conn").textContent = "live"; loadHistory(); };
-    sock.onmessage = function (m) { ingest(m.data); };
+    sock.onmessage = function (m) {
+      // Check for raw controller events (e.g. wsFrame) before Moonbug envelope parsing
+      try {
+        var msg = JSON.parse(m.data);
+        if (msg && msg.event === "wsFrame") { ingestWsFrame(msg); return; }
+      } catch (e) {}
+      // Default: Moonbug HTTP capture envelope
+      ingest(m.data);
+    };
     sock.onclose = function () {
       $("dot").className = ""; $("conn").textContent = "disconnected - retrying";
       setTimeout(connect, Math.min(5000, 500 * Math.pow(2, retry++)));
