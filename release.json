@@ -1,0 +1,13 @@
+{
+  "name": "LucyN",
+  "version": "1.0.1",
+  "cef_version": "156.0.7+g47dbc1d+chromium-156.0.8078.17",
+  "cef_build": "3652",
+  "chromium_version": "156.0.8078.17",
+  "requires_local_build": true,
+  "notice": "USING LUCYN REQUIRES YOU TO BUILD IT ON YOUR OWN MACHINE. We have no servers that can build LucyN for you, let alone host the builds: CEF (Chromium Embedded Framework) is about 1.5 GB per platform and 3+ GB unpacked, which is too big for GitHub Actions and far too big for us to publish for every OS and CPU architecture. Every release is the source code, zipped - nothing is compiled and no CEF is included. Fetch the CEF build listed above, then build with CMake.",
+  "download_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/archive/refs/tags/V1.0.1.zip",
+  "source_archive_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/archive/refs/tags/V1.0.1.zip",
+  "release_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/releases/tag/V1.0.1",
+  "docs_url": "https://github.com/LucyNBrowserEngine/LucyNEngine/blob/main/docs/building.md"
+}

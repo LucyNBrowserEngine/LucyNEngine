@@ -1,0 +1,11 @@
+# The CEF build LucyN compiles against and expects at runtime.
+#
+# LucyN does NOT vendor CEF: the distribution is ~1.5 GB per platform (3+ GB
+# unpacked), which is why releases are source-only and why this file exists.
+# `scripts/install.sh` fetches exactly this build into third_party/cef/, and
+# release.json / the release workflow read this file to state the version.
+#
+# Bump it only together with a build that has been verified against it.
+cef_version=156.0.7+g47dbc1d+chromium-156.0.8078.17
+cef_build=3652
+chromium_version=156.0.8078.17

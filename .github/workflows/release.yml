@@ -1,127 +1,189 @@
 name: Release
 
-# Builds the engine on Linux (x64 + arm64) and publishes one GitHub Release per V*.*.* tag.
-# Nothing is published unless EVERY platform's ctest passes: the release job has `needs: build`,
-# so any red matrix leg cancels it.
-# NOTE: Windows support is in progress — temporarily excluded from this matrix.
+# Publishes SOURCE ONLY.
+#
+# Nothing is compiled here, no CEF is downloaded, and no binaries are attached.
+# CEF (Chromium Embedded Framework) is ~1.5 GB per platform and 3+ GB unpacked;
+# shipping one build per OS/arch is far too big for GitHub Actions and its
+# artifact limits. So a release is:
+#
+#   LucyN-<version>-source.zip   the tracked source at that tag (no CEF, no build/)
+#   release.json                 version + the CEF build it expects + download URL
+#
+# release.json lives at the repo root and is refreshed on main after each
+# release, so a plain GET of the raw file answers "what is the current version
+# and where do I download it":
+#
+#   curl -s https://raw.githubusercontent.com/LucyNBrowserEngine/LucyNEngine/main/release.json
+#
+# Lowercase "v*.*.*" tags still belong to npm-publish.yml (JSR). This workflow
+# owns capital "V*.*.*" only.
 on:
   push:
     tags:
-      # Capital V on purpose: this is the RETRY channel for the binary release.
-      # The lowercase "v*.*.*" tags trigger npm-publish.yml (JSR), which can only
-      # publish each version once — while this workflow can be re-run or
-      # re-pushed (V1.0.1, V1.0.2, ...) as many times as a build needs without
-      # the package registry complaining that the version already exists.
-      # Ship both tags per release: vX.Y.Z for the package, VX.Y.Z for binaries.
       - "V*.*.*"
 
 permissions:
-  contents: write          # needed to create the release and upload assets
+  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            os: ubuntu-22.04
-            platform: linux64
-            artifact: lucyn-linux-x64.tar.gz
-            cmake_flags: '-DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"'
-    defaults:
-      run:
-        shell: bash
+  source-release:
+    name: Publish source archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ python3 ca-certificates curl xvfb xauth \
-            libx11-dev
-
-      - name: Fetch CEF
-        run: ./scripts/install.sh --yes --platform ${{ matrix.platform }}
-
-      - name: Configure (Release)
-        run: >
-          cmake -S . -B build
-          -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          ${{ matrix.cmake_flags }}
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: xvfb-run --auto-servernum ctest --test-dir build --build-config Release --output-on-failure
-
-      - name: "Package (self-contained: binary + Chromium runtime)"
+      - name: Read the pinned CEF version
+        id: cef
         run: |
           set -euo pipefail
-          mkdir -p dist/scripts
-          cp build/bin/lucyn dist/lucyn
-          # lucyn's rpath is $ORIGIN/cef — a binary WITHOUT its cef/ folder cannot
-          # start, so the whole Chromium runtime travels inside the tarball.
-          cp -a build/bin/cef dist/cef
-          # Default adblock filter lists are read from <exeDir>/adblock-filters/.
-          cp -a build/bin/adblock-filters dist/adblock-filters
-          # nothing-data/ is user state (cookies, captures, CEF cache) — never shipped.
-          #
-          # The distro's libcef.so carries debug symbols (1.4 GB). Stripping takes the
-          # tarball from roughly 700 MB to ~150 MB with zero runtime impact.
-          strip --strip-unneeded dist/lucyn dist/cef/libcef.so
-          cp scripts/install.sh scripts/update_cef.sh dist/scripts/
-          chmod +x dist/lucyn dist/scripts/*.sh
-          tar -czf "${{ matrix.artifact }}" -C dist lucyn cef adblock-filters scripts
-          ls -la "${{ matrix.artifact }}"
-          echo "tarball contents (top level):"
-          tar -tzf "${{ matrix.artifact }}" | awk -F/ '{print $1}' | sort -u
+          . ./cef-version.txt
+          echo "version=$cef_version" >> "$GITHUB_OUTPUT"
+          echo "build=$cef_build" >> "$GITHUB_OUTPUT"
+          echo "chromium=$chromium_version" >> "$GITHUB_OUTPUT"
 
-      - name: Upload bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: bundle-${{ matrix.name }}
-          path: ${{ matrix.artifact }}
-          if-no-files-found: error
-          retention-days: 7
+      - name: Derive the version from the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#[Vv]}"
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag '$GITHUB_REF_NAME' is not VMAJOR.MINOR.PATCH" >&2; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-  release:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      # `git archive` packages tracked files only, so the gitignored
+      # third_party/cef and build/ trees can never end up in the zip.
+      - name: Zip the source (no binaries, no CEF)
+        run: |
+          set -euo pipefail
+          NAME="LucyN-${{ steps.tag.outputs.version }}"
+          git archive --format=zip --prefix="$NAME/" -o "$NAME-source.zip" "$GITHUB_SHA"
+          ls -lh "$NAME-source.zip"
 
-      - name: Download bundles
-        uses: actions/download-artifact@v4
-        with:
-          pattern: bundle-*
-          path: dist
-          merge-multiple: true
+          # A release that quietly grows a binary or a CEF tree is a bug, not a feature.
+          if unzip -l "$NAME-source.zip" | grep -Ei '\.(so|dll|dylib|exe|a|bin)$|/cef/|/build/|libcef'; then
+            echo "refusing to publish: the archive contains binaries or a CEF distribution" >&2
+            exit 1
+          fi
 
-      - name: List assets
-        run: ls -la dist/
+      - name: Write release.json and the release notes
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          CEF_VERSION: ${{ steps.cef.outputs.version }}
+          CEF_BUILD: ${{ steps.cef.outputs.build }}
+          CHROMIUM: ${{ steps.cef.outputs.chromium }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
 
-      - name: Create release with auto-generated notes
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          files: dist/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          repo = os.environ["REPO"]
+          cef = os.environ["CEF_VERSION"]
+          cef_build = os.environ["CEF_BUILD"]
+          chromium = os.environ["CHROMIUM"]
+
+          notice = (
+              "USING LUCYN REQUIRES YOU TO BUILD IT ON YOUR OWN MACHINE. We have no servers "
+              "that can build LucyN for you, let alone host the builds: CEF (Chromium Embedded "
+              "Framework) is about 1.5 GB per platform and 3+ GB unpacked, which is too big for "
+              "GitHub Actions and far too big for us to publish for every OS and CPU "
+              "architecture. Every release is the source code, zipped - nothing is compiled and "
+              "no CEF is included. Fetch the CEF build listed above, then build with CMake."
+          )
+
+          manifest = {
+              "name": "LucyN",
+              "version": version,
+              "cef_version": cef,
+              "cef_build": cef_build,
+              "chromium_version": chromium,
+              "requires_local_build": True,
+              "notice": notice,
+              "download_url": (
+                  f"https://github.com/{repo}/releases/download/{tag}/LucyN-{version}-source.zip"
+              ),
+              "source_archive_url": f"https://github.com/{repo}/archive/refs/tags/{tag}.zip",
+              "release_url": f"https://github.com/{repo}/releases/tag/{tag}",
+              "docs_url": f"https://github.com/{repo}/blob/main/docs/building.md",
+          }
+          with open("release.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+
+          zip_url = manifest["download_url"]
+          body = f"""## LucyN {version} — source only
+          
+          This release is the **source code, zipped**. Nothing is compiled here, and no CEF
+          distribution is included or built by CI.
+          
+          | | |
+          |---|---|
+          | LucyN | `{version}` |
+          | CEF | `{cef}` (build {cef_build}) |
+          | Chromium | `{chromium}` |
+          
+          > {notice}
+          
+          ```bash
+          curl -L -o lucyn-source.zip {zip_url}
+          unzip lucyn-source.zip && cd LucyN-{version}
+          ./scripts/install.sh --version '{cef}'   # fetches that exact CEF build into third_party/cef/
+          cmake -S . -B build && cmake --build build -j
+          ```
+          """
+          with open("release-body.md", "w") as f:
+              f.write(body)
+
+          print(open("release.json").read())
+          PY
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NAME="LucyN-${{ steps.tag.outputs.version }}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber "$NAME-source.zip" release.json
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "LucyN ${{ steps.tag.outputs.version }} (source)" \
+              --notes-file release-body.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "LucyN ${{ steps.tag.outputs.version }} (source)" \
+              --notes-file release-body.md \
+              "$NAME-source.zip" release.json
+          fi
+
+      # The raw file on main is the "latest version + download URL" endpoint.
+      # Only fast-forward: a tag on an old commit must never rewind main.
+      - name: Refresh release.json on main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "tag is not on main; leaving main's release.json untouched"
+            exit 0
+          fi
+          if git diff --quiet -- release.json; then
+            echo "main's release.json already matches this release"
+            exit 0
+          fi
+          git add release.json
+          git commit -m "chore: release.json -> ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main
